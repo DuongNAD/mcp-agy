@@ -42,3 +42,8 @@ Thumbs.db
 # it is not product source, and .agents/survey_explorer_1/test_repo/ is a nested git
 # repository that cannot be stored here without submodule handling.
 .agents/
+
+# Claude Code project settings. Kept local: the allow-list auto-approves this
+# server's own tools, agy_execute_task among them, and that tool writes files.
+# Shipping it would hand every clone a pre-approved writer without opting in.
+.claude/settings.json
