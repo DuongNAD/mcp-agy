@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "mcp-agy": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "E:\\tool\\mcp_agy",
+        "run",
+        "mcp-agy"
+      ],
+      "env": {
+        "MCP_AGY_BACKEND": "cli",
+        "MCP_AGY_AUTO_FALLBACK": "false",
+        "MCP_AGY_LOG_LEVEL": "INFO",
+        "MCP_AGY_MODEL": "gemini-3.7-flash-high"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "agy_execute_task",
+        "agy_chat",
+        "agy_get_diff",
+        "agy_run_tests"
+      ]
+    }
+  }
+}

@@ -1,0 +1,44 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local environment overrides — may carry credentials
+.env
+.env.*
+!.env.example
+
+# Server logs
+*.log
+
+# Multi-agent construction scratch: briefings, handoffs and per-agent working notes
+# from building this project. Kept on disk as history, but out of version control —
+# it is not product source, and .agents/survey_explorer_1/test_repo/ is a nested git
+# repository that cannot be stored here without submodule handling.
+.agents/

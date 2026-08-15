@@ -1,0 +1,13 @@
+# Normalize line endings in the repository; check out native on each platform.
+* text=auto
+
+# Keep shell scripts LF so they stay executable under WSL/Git Bash.
+*.sh text eol=lf
+
+# Binary assets git should not try to diff or convert.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.wav binary
+*.pdf binary

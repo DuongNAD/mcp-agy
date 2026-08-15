@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-agy"
+version = "0.1.0"
+description = "FastMCP Server exposing Google Antigravity (AGY) as an autonomous coding worker for AI architect agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Antigravity Team", email = "support@antigravity.google" },
+]
+keywords = [
+    "mcp",
+    "fastmcp",
+    "antigravity",
+    "agy",
+    "claude-desktop",
+    "cursor",
+    "cline",
+    "roo-code",
+    "ai-agent",
+    "autonomous-coding",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Upper bound is load-bearing: mcp 2.0 removed `mcp.server.fastmcp` and renamed FastMCP to
+    # MCPServer (`mcp.server.mcpserver`). This server and the whole tests/ suite are written
+    # against the 1.x FastMCP API, so an unbounded `>=1.26.0` resolves into 2.x and every import
+    # of `mcp.server.fastmcp` fails at collection time.
+    "mcp>=1.26.0,<2.0.0",
+    "pydantic>=2.0.0",
+    "psutil>=5.9.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-timeout>=2.3.0",
+    "anyio>=4.0.0",
+]
+
+[project.scripts]
+mcp-agy = "mcp_agy.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/google/mcp-agy"
+Documentation = "https://github.com/google/mcp-agy#readme"
+Repository = "https://github.com/google/mcp-agy"
+Issues = "https://github.com/google/mcp-agy/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_agy"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = [
+    "tier1: Tier 1 unit tests covering individual MCP tools and models",
+    "tier2: Tier 2 boundary and corner case tests",
+    "tier3: Tier 3 cross-feature multi-step scenario tests",
+    "tier4: Tier 4 real-world integration and transport lifecycle tests",
+    "live: Live tests requiring external binaries and real API credentials",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestDeprecationWarning",
+]
