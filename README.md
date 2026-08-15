@@ -303,7 +303,7 @@ Claude Desktop interacts with MCP servers via local stdio processes.
       "command": "uv",
       "args": [
         "--directory",
-        "E:\\tool\\mcp_agy",
+        "C:\\path\\to\\mcp_agy",
         "run",
         "mcp-agy"
       ],
@@ -318,7 +318,7 @@ Claude Desktop interacts with MCP servers via local stdio processes.
   }
 }
 ```
-*(Replace `E:\\tool\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
+*(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 3. Fully restart Claude Desktop.
 4. Click the 🔨 **Hammer icon** in the bottom right corner of Claude's prompt bar. Verify that all 8 tools (`agy_execute_task`, `agy_chat`, `agy_get_diff`, `agy_run_tests`, `agy_start_task`, `agy_job_status`, `agy_cancel_job`, `agy_list_jobs`) appear with green indicators.
@@ -339,7 +339,7 @@ Cursor supports project-level MCP server definitions in `.cursor/mcp.json`.
       "command": "uv",
       "args": [
         "--directory",
-        "E:\\tool\\mcp_agy",
+        "C:\\path\\to\\mcp_agy",
         "run",
         "mcp-agy"
       ],
@@ -354,6 +354,8 @@ Cursor supports project-level MCP server definitions in `.cursor/mcp.json`.
   }
 }
 ```
+*(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
+
 3. Open Cursor Settings -> **Features** -> **MCP Servers**. Verify `mcp-agy` is listed and connected.
 4. Use Cursor Composer or Chat to instruct AGY directly.
 
@@ -374,7 +376,7 @@ Cline allows automated autonomous agent workflows with configurable auto-approva
       "command": "uv",
       "args": [
         "--directory",
-        "E:\\tool\\mcp_agy",
+        "C:\\path\\to\\mcp_agy",
         "run",
         "mcp-agy"
       ],
@@ -396,6 +398,7 @@ Cline allows automated autonomous agent workflows with configurable auto-approva
   }
 }
 ```
+*(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 ---
 
@@ -413,7 +416,7 @@ Roo Code allows specialized custom modes (Architect, Code, Test) delegating to A
       "command": "uv",
       "args": [
         "--directory",
-        "E:\\tool\\mcp_agy",
+        "C:\\path\\to\\mcp_agy",
         "run",
         "mcp-agy"
       ],
@@ -435,6 +438,7 @@ Roo Code allows specialized custom modes (Architect, Code, Test) delegating to A
   }
 }
 ```
+*(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 ---
 
@@ -448,7 +452,7 @@ Claude Code reads `.mcp.json` from the project root (see `configs/claude_code_mc
     "mcp-agy": {
       "type": "stdio",
       "command": "uv",
-      "args": ["--directory", "E:\\tool\\mcp_agy", "run", "mcp-agy"],
+      "args": ["--directory", "C:\\path\\to\\mcp_agy", "run", "mcp-agy"],
       "env": {
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "false",
@@ -460,6 +464,7 @@ Claude Code reads `.mcp.json` from the project root (see `configs/claude_code_mc
   }
 }
 ```
+*(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 `timeout` is not decoration — read the next section before your first real task.
 

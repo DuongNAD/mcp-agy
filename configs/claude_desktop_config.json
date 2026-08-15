@@ -4,7 +4,7 @@
       "command": "uv",
       "args": [
         "--directory",
-        "E:\\tool\\mcp_agy",
+        "C:\\path\\to\\mcp_agy",
         "run",
         "mcp-agy"
       ],
