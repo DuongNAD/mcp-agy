@@ -47,6 +47,8 @@ from mcp_agy.core.models import (
 from mcp_agy.core.sdk_backend import PythonSDKBackend, is_sdk_available
 from mcp_agy.server import create_mcp_server
 from mcp_agy.utils.process import (
+    STDERR_TAIL_LIMIT_BYTES,
+    SubprocessOutcome,
     run_subprocess_async,
     stream_subprocess_lines,
     terminate_process_tree,
@@ -138,6 +140,85 @@ class TestProcessManagement:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    @pytest.mark.asyncio
+    async def test_stream_reports_exit_code_and_stderr_tail(self) -> None:
+        """A caller that only sees stdout cannot tell a clean run from a failed one.
+
+        Regression: `agy` explains a refusal on stderr and can still exit having printed a
+        perfectly well-formed stdout stream. With stderr piped but never read, that
+        explanation was discarded and the failure reached the architect as an empty success.
+        """
+        code = (
+            "import sys\n"
+            "print('only-stdout-line', flush=True)\n"
+            "sys.stderr.write('jetski: a tool required the command permission\\n')\n"
+            "sys.exit(3)\n"
+        )
+        outcome = SubprocessOutcome()
+        lines: List[str] = []
+        async for line in stream_subprocess_lines(
+            [sys.executable, "-c", code],
+            timeout_seconds=10.0,
+            outcome=outcome,
+        ):
+            lines.append(line)
+
+        assert lines == ["only-stdout-line"]
+        assert outcome.returncode == 3
+        assert "command permission" in outcome.stderr_tail
+        assert outcome.stderr_truncated is False
+
+    @pytest.mark.asyncio
+    async def test_a_child_flooding_stderr_does_not_deadlock_the_stream(self) -> None:
+        """An unread pipe fills at ~64 KB and blocks the child mid-write, forever.
+
+        The child below writes 512 KB to stderr *before* its last stdout line, so if stderr
+        is not being drained concurrently it never reaches that line and this test hangs
+        until the timeout kills it. Only the tail is kept, bounded.
+        """
+        code = (
+            "import sys\n"
+            "print('first', flush=True)\n"
+            "sys.stderr.write('X' * 524288)\n"
+            "sys.stderr.write('\\nFINAL-STDERR-LINE\\n')\n"
+            "sys.stderr.flush()\n"
+            "print('last', flush=True)\n"
+        )
+        outcome = SubprocessOutcome()
+        lines: List[str] = []
+        async for line in stream_subprocess_lines(
+            [sys.executable, "-c", code],
+            timeout_seconds=30.0,
+            outcome=outcome,
+        ):
+            lines.append(line)
+
+        assert lines == ["first", "last"], "child blocked on a full stderr pipe"
+        assert outcome.returncode == 0
+        assert "FINAL-STDERR-LINE" in outcome.stderr_tail
+        assert outcome.stderr_truncated is True
+        assert len(outcome.stderr_tail) <= STDERR_TAIL_LIMIT_BYTES
+
+    @pytest.mark.asyncio
+    async def test_stderr_tail_survives_a_timeout(self) -> None:
+        """The reason a run stalled is on stderr, and a timeout is when it is needed most."""
+        code = (
+            "import sys, time\n"
+            "sys.stderr.write('waiting for approval\\n')\n"
+            "sys.stderr.flush()\n"
+            "time.sleep(30)\n"
+        )
+        outcome = SubprocessOutcome()
+        with pytest.raises(asyncio.TimeoutError):
+            async for _ in stream_subprocess_lines(
+                [sys.executable, "-c", code],
+                timeout_seconds=1.0,
+                outcome=outcome,
+            ):
+                pass
+
+        assert "waiting for approval" in outcome.stderr_tail
 
     @pytest.mark.asyncio
     async def test_run_subprocess_async_success(self) -> None:
@@ -432,6 +513,196 @@ class TestSubprocessCLIBackend:
         assert chat_res.response == "Done with diagnostic output."
         assert chat_res.tokens_used.total_tokens == 42
         assert chat_res.backend_used == "cli"
+
+    @pytest.mark.asyncio
+    async def test_result_event_error_text_reaches_the_caller(self) -> None:
+        """`result.status: ERROR` carries the reason in `result.error` - and it was dropped.
+
+        Captured live from agy 1.1.13: a model id that already encodes an effort level,
+        combined with an explicit --effort, is rejected before the model is ever called. The
+        architect received status='error' with error_details=None: a failure with nothing
+        to act on, and no way to learn that the fix is to drop one of the two flags.
+        """
+        ndjson_lines = [
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "conversation_id": "",
+                    "status": "ERROR",
+                    "response": "",
+                    "error": (
+                        'invalid model selection (--model "gemini-3.7-flash-high" '
+                        '--effort "low"): --model gemini-3.7-flash-high conflicts with '
+                        "--effort=low"
+                    ),
+                    "usage": {"total_tokens": 0},
+                },
+            }),
+        ]
+
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            for line in ndjson_lines:
+                yield line
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.chat(prompt="Reply with exactly one word: OK", effort="low")
+
+        assert res.status == "error"
+        assert "invalid model selection" in (res.error_details or "")
+        assert "conflicts with --effort=low" in (res.error_details or "")
+
+    @pytest.mark.asyncio
+    async def test_error_status_without_a_message_still_says_something(self) -> None:
+        """An error with no text must not degrade back into error_details=None."""
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            yield json.dumps({"event": "result", "result": {"status": "FAILED", "response": ""}})
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.chat(prompt="anything")
+
+        assert res.status == "error"
+        assert "FAILED" in (res.error_details or "")
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_is_not_reported_as_an_empty_success(self) -> None:
+        """A denied tool leaves `result.status: SUCCESS` with an empty response.
+
+        Captured live: run under headless permissions, agy auto-denied its own `run_command`,
+        recorded the denial in a step_update whose state is ERROR, then finished with
+        status SUCCESS and response "". The caller saw a successful call that answered
+        nothing and had no way to learn a tool had been refused.
+        """
+        ndjson_lines = [
+            json.dumps({"event": "init", "conversation_id": "conv-denied"}),
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-denied",
+                    "step_index": 3,
+                    "state": "ERROR",
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "duration_seconds": 0.014577,
+                    "tool_info": {
+                        "name": "run_command",
+                        "parameters": {"CommandLine": "git status -s"},
+                        "error": {
+                            "type": "TOOL_ERROR",
+                            "message": "User denied permission to run command:\ngit status -s",
+                        },
+                    },
+                },
+            }),
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv-denied",
+                    "status": "SUCCESS",
+                    "response": "",
+                    "usage": {"total_tokens": 27321},
+                },
+            }),
+        ]
+
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            for line in ndjson_lines:
+                yield line
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        request = ExecutionRequest(
+            prompt="Review the uncommitted changes",
+            workspace_path="E:/repo",
+            mode="plan",
+        )
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.execute(request)
+
+        assert res.status == "error"
+        assert "denied permission" in (res.error_message or "")
+        assert res.token_usage.total_tokens == 27321, "telemetry must survive the reclassification"
+
+        failed = [t for t in res.tool_calls if t.status == ToolStatus.FAILED]
+        assert len(failed) == 1, "a tool that failed must appear in the telemetry"
+        assert failed[0].tool_name == "run_command"
+        assert "git status -s" in (failed[0].error or "")
+
+    @pytest.mark.asyncio
+    async def test_empty_response_reports_the_stderr_that_explains_it(self) -> None:
+        """When agy says nothing and exits non-zero, its stderr is the whole diagnosis."""
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            oc = kwargs.get("outcome")
+            if oc is not None:
+                oc.returncode = 1
+                oc.stderr_tail = (
+                    'jetski: no output produced - a tool required the "command" permission '
+                    "that headless mode cannot prompt for, so it was auto-denied."
+                )
+            yield json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": ""}})
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.chat(prompt="Review this repo", workspace_path="E:/repo")
+
+        assert res.status == "error"
+        assert "auto-denied" in (res.error_details or "")
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_run_with_nothing_wrong_stays_a_success(self) -> None:
+        """No evidence of failure means no invented failure - an empty answer is still valid."""
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            oc = kwargs.get("outcome")
+            if oc is not None:
+                oc.returncode = 0
+            yield json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": ""}})
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.chat(prompt="anything")
+
+        assert res.status == "success"
+        assert res.error_details is None
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_edits_files_silently_stays_a_success(self) -> None:
+        """An execute_task run may edit files and say nothing; that is not a failure."""
+        ndjson_lines = [
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "state": "DONE",
+                    "step_type": "tool",
+                    "tool_name": "write_to_file",
+                    "tool_info": {
+                        "name": "write_to_file",
+                        "parameters": {"TargetFile": "src/auth.py"},
+                    },
+                },
+            }),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": ""}}),
+        ]
+
+        async def _mock_stream(*args: Any, **kwargs: Any) -> AsyncIterator[str]:
+            oc = kwargs.get("outcome")
+            if oc is not None:
+                oc.returncode = 0
+                oc.stderr_tail = "warning: something cosmetic"
+            for line in ndjson_lines:
+                yield line
+
+        backend = SubprocessCLIBackend(executable_path="C:/fake/agy.exe")
+        with patch.object(backend, "is_available", return_value=True), \
+             patch("mcp_agy.core.cli_backend.stream_subprocess_lines", side_effect=_mock_stream):
+            res = await backend.execute_task(workspace_path="E:/repo", prompt="Implement auth")
+
+        assert res.status == "success"
+        assert res.modified_files == ["src/auth.py"]
 
     @pytest.mark.asyncio
     async def test_cli_backend_unavailable_error_handling(self) -> None:

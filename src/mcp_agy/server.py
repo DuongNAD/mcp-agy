@@ -1,10 +1,20 @@
 """FastMCP Server implementation exposing Google Antigravity (AGY) tools.
 
-This module registers the 4 primary tools for external AI architect agents:
+This module registers the tools available to external AI architect agents.
+
+Synchronous - the call blocks until AGY is done, so they suit runs shorter than the client's
+per-call timeout:
 - agy_execute_task: Autonomous coding execution in workspace
 - agy_chat: Analytical / architectural consultation in read-only mode
 - agy_get_diff: Git status and unified diff inspection
 - agy_run_tests: Workspace test suite execution and diagnostics
+
+Background - the run outlives the call that started it, which is what makes a multi-minute
+task possible at all against a client that caps a single call at 60 seconds:
+- agy_start_task: Launch a run, return a job id immediately
+- agy_job_status: Collect a job's result, optionally waiting a bounded number of seconds
+- agy_cancel_job: Stop a run and kill its process tree
+- agy_list_jobs: Recover job ids and see what is still running
 """
 
 from __future__ import annotations
@@ -19,9 +29,13 @@ from pydantic import Field
 from mcp_agy import __version__
 from mcp_agy.core.backend import AGYBackend, get_backend
 from mcp_agy.core.diff_engine import GitDiffEngine, inspect_git_diff
+from mcp_agy.core.jobs import JobRecord, get_job_manager
 from mcp_agy.core.models import (
     ChatResult,
     DiffResult,
+    JobHandle,
+    JobListResult,
+    JobStatusResult,
     TaskExecutionResult,
     TestRunResult,
     TestSummary,
@@ -57,7 +71,7 @@ def create_mcp_server(
     debug: bool = False,
     log_level: str = "INFO",
 ) -> FastMCP:
-    """Create and configure the FastMCP server with all 4 primary tools.
+    """Create and configure the FastMCP server with all 8 tools.
 
     Args:
         backend: Optional explicit AGYBackend instance to use.
@@ -484,6 +498,272 @@ def create_mcp_server(
                 test_command=test_command,
                 timeout_seconds=timeout_seconds,
             )
+
+    def _describe_job(job: JobRecord, include_result: bool = True) -> JobStatusResult:
+        """Render a job record as the wire model, whatever state it is in.
+
+        `include_result` is off for listings: a finished job's result carries AGY's full prose
+        response, and the registry keeps up to 100 of them. Sending them all back to answer
+        "what is running?" would spend more of the architect's context than the question is
+        worth. The listing carries the metadata; `agy_job_status` carries the result.
+        """
+        return JobStatusResult(
+            status=job.status,  # type: ignore[arg-type]
+            job_id=job.job_id,
+            kind=job.kind,
+            workspace_path=job.workspace_path,
+            prompt_preview=job.prompt_preview,
+            is_done=job.is_done,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+            duration_seconds=job.duration_seconds,
+            result=(
+                job.result
+                if include_result and isinstance(job.result, TaskExecutionResult)
+                else None
+            ),
+            error_details=job.error_details,
+        )
+
+    @server.tool(
+        name="agy_start_task",
+        description=(
+            "Starts an AGY coding or analysis run in the background and returns a job id immediately.\n\n"
+            "Use this instead of `agy_execute_task` for anything that takes more than about half a "
+            "minute - which is most real work. Every MCP client caps how long it waits for a single "
+            "tool call (Claude Code: 60 seconds by default, a hard wall-clock limit), so a synchronous "
+            "call to a task that runs for minutes is dropped by the client and its work is lost. This "
+            "tool returns at once; AGY keeps working in the server; you collect the result later with "
+            "`agy_job_status`.\n\n"
+            "Architect Guidance:\n"
+            "- Start the job, then do something else - inspect files, plan the next step, start another "
+            "job in a different workspace - and collect the result when you need it.\n"
+            "- `agy_job_status(job_id, wait_seconds=30)` blocks briefly and returns as soon as the job "
+            "finishes, so a short job needs no polling loop.\n"
+            "- mode='plan' is the read-only form: AGY investigates and reports without touching files.\n"
+            "- Jobs live in the server process. If the server restarts, `agy_job_status` reports "
+            "'not_found' and the run must be re-issued.\n\n"
+            "Args:\n"
+            "    workspace_path: Absolute or relative path to the target repository. Must exist.\n"
+            "    prompt: Clear, detailed, self-contained instructions for AGY.\n"
+            "    auto_approve: Automatically approve tool calls and file edits (default: True).\n"
+            "    mode: 'accept-edits' for full coding/editing (default), or 'plan' for read-only analysis.\n"
+            "    timeout_seconds: Maximum execution time for the run itself (default: 600s, max: 3600).\n\n"
+            "Returns:\n"
+            "    JobHandle containing status, job_id, kind, workspace_path, started_at, and error_details."
+        ),
+    )
+    async def agy_start_task(
+        workspace_path: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description="Absolute or relative filesystem path to the target workspace/repository where AGY will work. Must be an existing directory.",
+            ),
+        ],
+        prompt: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description="Comprehensive natural language instructions detailing the coding task, requirements, expected file changes, architecture rules, or terminal commands for AGY to execute.",
+            ),
+        ],
+        auto_approve: Annotated[
+            bool,
+            Field(
+                description="When True (default), automatically approves all AGY tool executions without blocking for interactive confirmation.",
+            ),
+        ] = True,
+        mode: Annotated[
+            Literal["accept-edits", "plan"],
+            Field(
+                description="Execution mode: 'accept-edits' (default) enables autonomous coding with file modification; 'plan' runs read-only analysis.",
+            ),
+        ] = "accept-edits",
+        timeout_seconds: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=3600,
+                description="Maximum duration of the background run in seconds before it is cancelled (default: 600). This bounds AGY, not this call - this call returns immediately.",
+            ),
+        ] = 600,
+        model: Annotated[
+            str,
+            Field(
+                description="Optional model id for this task (e.g. 'gemini-3.7-flash-high'). Empty uses MCP_AGY_MODEL, else the agy CLI default.",
+            ),
+        ] = "",
+        effort: Annotated[
+            str,
+            Field(
+                description="Optional reasoning effort: 'low', 'medium', or 'high'. Leave empty when the model id already encodes one - the CLI rejects the combination.",
+            ),
+        ] = "",
+    ) -> JobHandle:
+        """Starts an AGY run in the background and returns a job id immediately."""
+        logger.info(f"agy_start_task invoked for workspace='{workspace_path}', mode='{mode}'")
+
+        if not prompt.strip():
+            return JobHandle(status="error", error_details="Prompt cannot be empty or whitespace only.")
+
+        if not workspace_path.strip():
+            return JobHandle(
+                status="error", error_details="Workspace path cannot be empty or whitespace only."
+            )
+
+        try:
+            validated_ws = validate_workspace_path(workspace_path)
+        except WorkspaceError as exc:
+            logger.warning(f"Workspace validation failed for '{workspace_path}': {exc}")
+            return JobHandle(status="error", error_details=f"Workspace validation failed: {exc}")
+
+        normalized_workspace = str(validated_ws)
+        lock_mgr = get_workspace_lock_manager()
+
+        extra: dict[str, Any] = {}
+        if model.strip():
+            extra["model"] = model.strip()
+        if effort.strip():
+            extra["effort"] = effort.strip()
+
+        async def _run() -> TaskExecutionResult:
+            # The lock is taken inside the job, not by the call that started it: two jobs against
+            # the same workspace must still serialize, but the architect must not be made to wait
+            # for that here - waiting is the thing this tool exists to avoid.
+            async with lock_mgr.lock(validated_ws):
+                if backend_executor is not None:
+                    return await backend_executor(
+                        workspace_path=normalized_workspace,
+                        prompt=prompt,
+                        auto_approve=auto_approve,
+                        mode=mode,
+                        timeout_seconds=timeout_seconds,
+                        **extra,
+                    )
+                active_backend = _resolve_backend()
+                return await active_backend.execute_task(
+                    workspace_path=normalized_workspace,
+                    prompt=prompt,
+                    auto_approve=auto_approve,
+                    mode=mode,
+                    timeout_seconds=timeout_seconds,
+                    **extra,
+                )
+
+        job = get_job_manager().start(
+            runner=_run,
+            kind="plan" if mode == "plan" else "task",
+            workspace_path=normalized_workspace,
+            prompt=prompt,
+        )
+        return JobHandle(
+            status="running",
+            job_id=job.job_id,
+            kind=job.kind,
+            workspace_path=job.workspace_path,
+            started_at=job.started_at,
+        )
+
+    @server.tool(
+        name="agy_job_status",
+        description=(
+            "Checks a background AGY job and returns its full result once it has finished.\n\n"
+            "Architect Guidance:\n"
+            "- Pass `wait_seconds` to block until the job finishes instead of polling: the call returns "
+            "the moment the job is done, or at the deadline with status still 'running'. Keep it below "
+            "your client's per-call cap (Claude Code: 60s by default) - 30 is a safe default.\n"
+            "- `status: 'completed'` means the job ran to completion; read `result.status` for whether "
+            "AGY itself succeeded, and `result.modified_files` for what it changed.\n"
+            "- 'not_found' means the id is unknown to this server - typically because it restarted.\n\n"
+            "Args:\n"
+            "    job_id: Identifier returned by agy_start_task.\n"
+            "    wait_seconds: Seconds to wait for completion before returning (default: 0, max: 45).\n\n"
+            "Returns:\n"
+            "    JobStatusResult containing status, is_done, duration_seconds, result, and error_details."
+        ),
+    )
+    async def agy_job_status(
+        job_id: Annotated[
+            str,
+            Field(min_length=1, description="Identifier of the job to inspect, as returned by agy_start_task."),
+        ],
+        wait_seconds: Annotated[
+            int,
+            Field(
+                ge=0,
+                le=45,
+                description="Block up to this many seconds waiting for the job to finish, returning early the moment it does. 0 (default) reports the current state immediately. Capped at 45 so this call always returns inside a client's per-call timeout.",
+            ),
+        ] = 0,
+    ) -> JobStatusResult:
+        """Checks a background AGY job and returns its full result once it has finished."""
+        manager = get_job_manager()
+        job = await manager.wait(job_id, float(wait_seconds)) if wait_seconds else manager.get(job_id)
+        if job is None:
+            return JobStatusResult(
+                status="not_found",
+                job_id=job_id,
+                error_details=(
+                    "No job with that id in this server process. Jobs do not survive a server "
+                    "restart; re-issue the run with agy_start_task."
+                ),
+            )
+        return _describe_job(job)
+
+    @server.tool(
+        name="agy_cancel_job",
+        description=(
+            "Stops a running background AGY job and terminates its process tree.\n\n"
+            "Architect Guidance:\n"
+            "- Use when a task is going the wrong way, or before starting a replacement run against the "
+            "same workspace.\n"
+            "- Cancellation is not a rollback: files AGY already wrote stay written. Call `agy_get_diff` "
+            "afterwards to see what landed.\n\n"
+            "Args:\n"
+            "    job_id: Identifier returned by agy_start_task.\n\n"
+            "Returns:\n"
+            "    JobStatusResult describing the job after cancellation."
+        ),
+    )
+    async def agy_cancel_job(
+        job_id: Annotated[
+            str,
+            Field(min_length=1, description="Identifier of the job to cancel, as returned by agy_start_task."),
+        ],
+    ) -> JobStatusResult:
+        """Stops a running background AGY job and terminates its process tree."""
+        logger.info(f"agy_cancel_job invoked for job_id='{job_id}'")
+        job = await get_job_manager().cancel(job_id)
+        if job is None:
+            return JobStatusResult(
+                status="not_found",
+                job_id=job_id,
+                error_details="No job with that id in this server process.",
+            )
+        return _describe_job(job)
+
+    @server.tool(
+        name="agy_list_jobs",
+        description=(
+            "Lists every background AGY job this server knows about, newest first.\n\n"
+            "Architect Guidance:\n"
+            "- Use to recover a job id you no longer have, or to see what is still running before "
+            "starting more work.\n"
+            "- Results are omitted here to keep the listing small; collect a finished job's result "
+            "with `agy_job_status(job_id)`.\n"
+            "- Finished jobs are pruned an hour after they end.\n\n"
+            "Returns:\n"
+            "    JobListResult containing jobs (newest first) and running_count."
+        ),
+    )
+    async def agy_list_jobs() -> JobListResult:
+        """Lists every background AGY job this server knows about, newest first."""
+        jobs = [_describe_job(j, include_result=False) for j in get_job_manager().list_jobs()]
+        return JobListResult(
+            jobs=jobs,
+            running_count=sum(1 for j in jobs if not j.is_done),
+        )
 
     return server
 

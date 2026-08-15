@@ -7,10 +7,19 @@ from mcp_agy.core.backend import (
     reset_backend,
     set_backend,
 )
+from mcp_agy.core.jobs import (
+    JobManager,
+    JobRecord,
+    get_job_manager,
+    reset_job_manager,
+)
 from mcp_agy.core.models import (
     ChatResult,
     DiffResult,
     FileDiffStat,
+    JobHandle,
+    JobListResult,
+    JobStatusResult,
     TaskExecutionResult,
     TestFailure,
     TestRunResult,
@@ -32,4 +41,11 @@ __all__ = [
     "TestFailure",
     "TestSummary",
     "TestRunResult",
+    "JobManager",
+    "JobRecord",
+    "get_job_manager",
+    "reset_job_manager",
+    "JobHandle",
+    "JobStatusResult",
+    "JobListResult",
 ]

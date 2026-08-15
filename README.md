@@ -144,7 +144,39 @@ pip install -e .
 
 ## 🧰 4. Complete Tool Suite Reference
 
-`mcp-agy` exposes 4 core tools specifically tailored for AI Architect agents:
+`mcp-agy` exposes 8 tools tailored for AI Architect agents: 4 synchronous ones that answer
+within a call, and 4 that run AGY as a background job so a long task never has to fit inside
+one.
+
+**Which to reach for.** `agy_execute_task` and `agy_chat` block until AGY is done, so they only
+work for runs shorter than your client's per-call timeout — 60 seconds on Claude Code. For
+anything larger, and that is most real work, start a job:
+
+```
+agy_start_task(workspace, prompt)          -> {"job_id": "...", "status": "running"}   # returns at once
+   … the architect keeps working …
+agy_job_status(job_id, wait_seconds=30)    -> {"status": "completed", "result": {...}} # collect
+agy_get_diff(workspace)                    -> review what AGY actually changed
+agy_run_tests(workspace)                   -> verify it
+```
+
+`agy_job_status` with `wait_seconds` returns the instant the job finishes, so a short job needs
+no polling loop and a long one costs one cheap call per check. Jobs live in the server process:
+if it restarts, `agy_job_status` answers `not_found` and the run must be re-issued.
+
+| Tool Name | Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| **`agy_start_task`** | `workspace_path` | `str` | **Yes** | — | Target workspace. Returns a `job_id` immediately; AGY keeps running in the server. |
+| | `prompt` | `str` | **Yes** | — | Self-contained instructions for AGY. |
+| | `auto_approve` | `bool` | No | `True` | Auto-approve AGY's tool executions and file edits. |
+| | `mode` | `Literal["accept-edits", "plan"]` | No | `"accept-edits"` | `"plan"` is the read-only form — the long-running equivalent of `agy_chat`. |
+| | `timeout_seconds` | `int` | No | `600` | Bounds **the run**, not this call (1 to 3600). |
+| **`agy_job_status`** | `job_id` | `str` | **Yes** | — | Id returned by `agy_start_task`. |
+| | `wait_seconds` | `int` | No | `0` | Block up to N seconds, returning early on completion. Capped at 45 so the call always fits inside a client timeout. |
+| **`agy_cancel_job`** | `job_id` | `str` | **Yes** | — | Stops the run and kills its process tree. Not a rollback — files already written stay written. |
+| **`agy_list_jobs`** | — | — | — | — | Every known job, newest first, without their results. The recovery path when a `job_id` has fallen out of context; collect a result with `agy_job_status`. |
+
+And the 4 synchronous tools:
 
 | Tool Name | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|---|
@@ -289,7 +321,7 @@ Claude Desktop interacts with MCP servers via local stdio processes.
 *(Replace `E:\\tool\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 3. Fully restart Claude Desktop.
-4. Click the 🔨 **Hammer icon** in the bottom right corner of Claude's prompt bar. Verify that all 4 tools (`agy_execute_task`, `agy_chat`, `agy_get_diff`, `agy_run_tests`) appear with green indicators.
+4. Click the 🔨 **Hammer icon** in the bottom right corner of Claude's prompt bar. Verify that all 8 tools (`agy_execute_task`, `agy_chat`, `agy_get_diff`, `agy_run_tests`, `agy_start_task`, `agy_job_status`, `agy_cancel_job`, `agy_list_jobs`) appear with green indicators.
 
 ---
 
@@ -406,9 +438,100 @@ Roo Code allows specialized custom modes (Architect, Code, Test) delegating to A
 
 ---
 
+### 5. Claude Code Setup
+
+Claude Code reads `.mcp.json` from the project root (see `configs/claude_code_mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "mcp-agy": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["--directory", "E:\\tool\\mcp_agy", "run", "mcp-agy"],
+      "env": {
+        "MCP_AGY_BACKEND": "cli",
+        "MCP_AGY_AUTO_FALLBACK": "false",
+        "MCP_AGY_LOG_LEVEL": "INFO",
+        "MCP_AGY_MODEL": "gemini-3.7-flash-high"
+      },
+      "timeout": 1800000
+    }
+  }
+}
+```
+
+`timeout` is not decoration — read the next section before your first real task.
+
+---
+
+### ⏱️ Raise the client's call timeout, or nothing here works
+
+**Every tool in this server is a wrapper around a call that takes minutes.** A real
+`agy_execute_task` on a real repository runs for 2–20 minutes; even an `agy_chat` review of a
+handful of files takes several. Every MCP client caps how long it will wait for a single tool
+call, and the defaults are all far below that. When the cap fires the client reports
+`Error: Request timed out` and *drops the call* — the architect gets a bare failure, and the
+work AGY did in those minutes is discarded.
+
+**Claude Code's default cap is 60 seconds** — measured, not quoted: a client-side log of a live
+`agy_chat` shows `still running (30s elapsed)`, `still running (60s elapsed)`, then
+`Error: Request timed out`. Two ways to raise it, either is enough:
+
+| Where | Setting | Notes |
+|---|---|---|
+| `.mcp.json`, per server | `"timeout": 1800000` | Milliseconds. Overrides the env var for this server only. Values under `1000` are ignored. |
+| `settings.json`, `env` block | `"MCP_TOOL_TIMEOUT": "1800000"` | Milliseconds. Applies to every MCP server the client launches. |
+
+Both are read when the client starts, so **restart the client** after changing either.
+
+> **Progress notifications will not save you.** Claude Code documents `timeout` as a *hard
+> wall-clock limit per call*, explicitly stating that progress notifications do not extend it.
+> A keepalive heartbeat from this server would be wasted effort against that client — raising
+> the cap is the only fix.
+
+Other clients cap calls too — Claude Desktop, Cursor, Cline and Roo Code each expose their own
+timeout setting. If a long task fails while the server log shows AGY still working, that cap is
+the first thing to check.
+
+---
+
 ## 🎯 6. High-Yield Prompt Templates for Architect Agents
 
 These templates are battle-tested prompts designed for LLMs acting in the **Architect Role** to orchestrate Google Antigravity:
+
+### Template 0: The delegation loop (use this for anything that takes minutes)
+
+The shape every other template should be run in. The architect never blocks on the worker, and
+never takes the worker's word for what it did.
+
+```markdown
+1. DELEGATE — hand over one self-contained unit of work:
+   agy_start_task(workspace_path="E:/Project/Thing",
+                  prompt="<one job, exact files, explicit acceptance criteria>")
+   -> {"job_id": "…", "status": "running"}          # returns in milliseconds
+
+2. KEEP WORKING — read the code you are about to review, plan the next unit,
+   or start a second job in a *different* workspace. Do not sit on the job id.
+
+3. COLLECT — agy_job_status(job_id, wait_seconds=30)
+   'running'   -> ask again later, the run is unharmed
+   'completed' -> read result.status, result.response, result.modified_files
+
+4. VERIFY — never accept the worker's own report as evidence:
+   agy_get_diff(workspace_path=…)     # what actually changed on disk
+   agy_run_tests(workspace_path=…)    # whether it still works
+
+5. DECIDE — accept, or send back one corrective job naming exactly what was wrong.
+   agy_cancel_job(job_id) if a run is heading the wrong way; cancelling is not a
+   rollback, so follow it with agy_get_diff to see what already landed.
+```
+
+**Writing the prompt is the architect's real work.** A worker prompt earns its keep when it
+carries: the exact files to touch and the ones not to, the defect stated as *what happens*
+rather than *what to change*, an acceptance criterion the worker can check itself, and the
+project's own constraints (test command, style gate, forbidden dependencies). Vague delegation
+is what produces a confident report and an unusable diff.
 
 ### Template 1: Greenfield Feature Implementation & Scaffolding
 ```markdown
@@ -643,6 +766,12 @@ python -m mcp_agy --debug 2> stderr.log
   - *A*: `MultiEcosystemTestRunner` automatically checks for local `.venv`, `venv`, or `env` directories and injects their executable directory into `PATH` during test execution.
 - **Q: Can multiple MCP clients use `mcp-agy` simultaneously?**
   - *A*: Yes. FastMCP supports concurrent sessions, and `WorkspaceLockManager` serializes operations targeting the same workspace repository to prevent race conditions.
+- **Q: A call fails with `Error: Request timed out` after about a minute, every time.**
+  - *A*: That is the client giving up, not AGY. See *"Raise the client's call timeout"* at the end of §5. AGY keeps running for a moment after the client drops the call, then the server kills the process tree — no orphans, but the work is lost.
+- **Q: `error_details` says `invalid model selection ... conflicts with --effort=low`.**
+  - *A*: Model ids ending in `-low` / `-high` already carry a reasoning effort, so passing `effort` as well is a contradiction the CLI refuses before it starts. Either drop the `effort` argument or pick a model id without the suffix. Run `agy models` for the valid ids.
+- **Q: A call returns `status: "error"` and `AGY returned an empty response`.**
+  - *A*: AGY started, decided it needed a tool, and could not use it — most often a permission it cannot prompt for in headless mode. The rest of `error_details` carries the tool that was refused and AGY's own stderr. Check that the config passes `auto_approve` (the default) so the CLI runs with `--dangerously-skip-permissions`.
 
 ---
 

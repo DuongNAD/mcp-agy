@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from dataclasses import dataclass
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
 import psutil
@@ -16,6 +17,42 @@ import psutil
 from mcp_agy.utils.logger import get_logger
 
 logger = get_logger("mcp_agy.utils.process")
+
+# How much of a child's stderr is kept. The tail is what matters: a CLI states why it gave up
+# on its last lines. Bounded so a chatty child cannot grow the server's memory without limit.
+STDERR_TAIL_LIMIT_BYTES = 8192
+
+
+@dataclass
+class SubprocessOutcome:
+    """Out-of-band result of a streamed subprocess, filled in as the stream closes.
+
+    `stream_subprocess_lines` yields stdout lines, so a caller that needs the exit code or
+    the child's stderr has nowhere to receive them. Passing one of these in gives that
+    channel: after the stream ends - normally, by timeout, or by cancellation - the fields
+    below describe how the child actually finished.
+    """
+
+    returncode: Optional[int] = None
+    stderr_tail: str = ""
+    stderr_truncated: bool = False
+
+
+async def _drain_stream_tail(stream: asyncio.StreamReader, sink: bytearray) -> bool:
+    """Read a pipe to EOF, keeping only its last STDERR_TAIL_LIMIT_BYTES. Returns True if cut.
+
+    Draining is not optional. A pipe nobody reads fills after roughly 64 KB and then blocks
+    the child mid-write forever, which the caller sees as a hang until its timeout fires.
+    """
+    truncated = False
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return truncated
+        sink.extend(chunk)
+        if len(sink) > STDERR_TAIL_LIMIT_BYTES:
+            del sink[:-STDERR_TAIL_LIMIT_BYTES]
+            truncated = True
 
 
 def terminate_process_tree(pid: int, timeout: float = 3.0) -> None:
@@ -79,6 +116,7 @@ async def stream_subprocess_lines(
     cwd: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     timeout_seconds: float = 600.0,
+    outcome: Optional[SubprocessOutcome] = None,
 ) -> AsyncGenerator[str, None]:
     """Spawns an async subprocess and yields stdout lines in real-time with timeout protection.
 
@@ -89,6 +127,9 @@ async def stream_subprocess_lines(
         cwd: Working directory for subprocess.
         env: Environment variables dictionary.
         timeout_seconds: Maximum overall runtime in seconds.
+        outcome: Optional SubprocessOutcome to receive the exit code and stderr tail once
+            the stream closes. Stderr is drained either way; this only decides whether the
+            caller gets to read it.
 
     Yields:
         Decoded and stripped stdout lines in real-time.
@@ -106,6 +147,11 @@ async def stream_subprocess_lines(
         cwd=cwd,
         env=env,
     )
+
+    stderr_sink = bytearray()
+    stderr_task: Optional[asyncio.Task[bool]] = None
+    if proc.stderr is not None:
+        stderr_task = asyncio.create_task(_drain_stream_tail(proc.stderr, stderr_sink))
 
     try:
         loop = asyncio.get_running_loop()
@@ -164,6 +210,27 @@ async def stream_subprocess_lines(
                 await proc.wait()
             except Exception:
                 pass
+
+        truncated = False
+        if stderr_task is not None:
+            # The child is gone by now, so EOF is already in the pipe and this returns at once.
+            # The bound is there for the pathological case of a grandchild still holding the
+            # write end open - waiting on that forever would trade one hang for another.
+            try:
+                truncated = await asyncio.wait_for(stderr_task, timeout=1.0)
+            except BaseException:
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except BaseException:
+                    pass
+
+        if outcome is not None:
+            outcome.returncode = proc.returncode
+            outcome.stderr_truncated = truncated
+            outcome.stderr_tail = (
+                bytes(stderr_sink).decode("utf-8", errors="replace").strip()
+            )
 
 
 async def run_subprocess_async(

@@ -38,6 +38,25 @@ _PYTEST_SUMMARY_LINE = re.compile(
     re.MULTILINE,
 )
 
+# Under `-q` pytest drops the surrounding rule and prints the counts bare, e.g.
+# "22 passed, 1 warning in 6.69s". Only the banner form was recognised, so a custom
+# `test_command` carrying -q fell through to the generic parser: a 22-passed run came back
+# as passed=1 alongside failed=1, because the generic scan found the word "fail" inside an
+# unrelated pydantic warning ("settings sources may fail to correctly resolve its value").
+# Anchored on the leading count and pytest's trailing duration - which it always appends,
+# with an extra "(0:01:05)" once a run passes a minute - so prose cannot match.
+_PYTEST_QUIET_SUMMARY_LINE = re.compile(
+    r"^\s*\d+\s+(?:passed|failed|error|errors|skipped|xfailed|xpassed|deselected)\b"
+    r"[^\n]*\bin\s+[\d.]+s\b[^\n]*$",
+    re.MULTILINE,
+)
+
+# Verdict markers for the last-resort generic parser, matched case-sensitively: an unknown
+# runner shouts its result ("FAILED", "PASS"), while ordinary prose in a warning or traceback
+# says "fail" in lower case. The old case-insensitive scan could not tell the two apart.
+_GENERIC_FAILURE_TOKEN = re.compile(r"\b(?:FAIL|FAILED|FAILURE|FAILURES|ERROR|ERRORS)\b")
+_GENERIC_PASS_TOKEN = re.compile(r"\b(?:PASS|PASSED|SUCCESS|OK)\b")
+
 
 def strip_ansi_codes(text: str) -> str:
     """Strip terminal ANSI CSI, OSC, and control escape sequences from text."""
@@ -283,11 +302,16 @@ class MultiEcosystemTestRunner:
                 fw = "cargo"
             elif "--- FAIL:" in clean_text or "--- PASS:" in clean_text:
                 fw = "go"
-            elif "Test Suites:" in clean_text or re.search(r"^Tests:\s", clean_text, re.MULTILINE):
+            elif (
+                "Test Suites:" in clean_text
+                or re.search(r"^Tests:\s", clean_text, re.MULTILINE)
+                # Vitest's own summary line, which carries no colon: "Tests  27 passed (27)"
+                or re.search(r"^[ \t]*Tests[ \t]+[^\n(]*\(\d+\)[ \t]*$", clean_text, re.MULTILINE)
+            ):
                 fw = "npm"
             elif re.search(r"^Ran \d+ tests? in ", clean_text, re.MULTILINE):
                 fw = "unittest"
-            elif _PYTEST_SUMMARY_LINE.search(clean_text):
+            elif _PYTEST_SUMMARY_LINE.search(clean_text) or _PYTEST_QUIET_SUMMARY_LINE.search(clean_text):
                 fw = "pytest"
 
         if fw in ("pytest", "uv", "poetry"):
@@ -535,6 +559,32 @@ class MultiEcosystemTestRunner:
         errors = 0
         total = 0
 
+        # Vitest drops Jest's colon and its "N total", writing the total in parentheses instead:
+        # "Tests  27 passed (27)", or "Tests  2 failed | 25 passed (27)" when something broke.
+        # Matched before the Jest form because a vitest run has no line the Jest patterns can
+        # read - a real 27-test run came back as the generic parser's "1 passed", which tells
+        # the architect the suite ran but not that it ran *27 tests*.
+        m_vitest = re.search(r"^[ \t]*Tests[ \t]+([^\n(]*)\((\d+)\)[ \t]*$", text, re.MULTILINE)
+        if m_vitest:
+            body, total_text = m_vitest.group(1), m_vitest.group(2)
+            for count_text, label in re.findall(
+                r"(\d+)\s+(passed|failed|skipped|todo|pending)", body
+            ):
+                count = int(count_text)
+                if label == "passed":
+                    passed = count
+                elif label == "failed":
+                    failed = count
+                else:
+                    skipped += count
+            total = int(total_text)
+            return (
+                TestSummary(
+                    total=total, passed=passed, failed=failed, skipped=skipped, errors=errors
+                ),
+                self._parse_jest_failure_blocks(text),
+            )
+
         # Pattern: "Tests: 1 failed, 2 skipped, 12 passed, 15 total" (order-independent)
         m_tests_line = re.search(r"Tests:\s+([^\n]+)", text)
         if m_tests_line:
@@ -563,6 +613,19 @@ class MultiEcosystemTestRunner:
                 passed = int(m_suites.group(2)) if m_suites.group(2) else 0
                 total = int(m_suites.group(3)) if m_suites.group(3) else (passed + failed)
 
+        failures = self._parse_jest_failure_blocks(text)
+
+        summary = TestSummary(
+            total=total or (passed + failed + skipped + errors),
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            errors=errors,
+        )
+        return summary, failures
+
+    def _parse_jest_failure_blocks(self, text: str) -> List[TestFailure]:
+        """Extract the per-failure blocks Jest and Vitest both mark with a bullet."""
         failures: List[TestFailure] = []
         # Pattern: "● Auth Module › fails with bad password"
         block_pattern = re.compile(r"●\s+([^\n]+)\n([\s\S]*?)(?=(?:\n\s*●|\nTest Suites:|\nTests:|\Z))")
@@ -586,15 +649,7 @@ class MultiEcosystemTestRunner:
                     traceback=body,
                 )
             )
-
-        summary = TestSummary(
-            total=total or (passed + failed + skipped + errors),
-            passed=passed,
-            failed=failed,
-            skipped=skipped,
-            errors=errors,
-        )
-        return summary, failures
+        return failures
 
     def _parse_go_diagnostics(self, text: str) -> Tuple[TestSummary, List[TestFailure]]:
         """Parse Go test output."""
@@ -727,15 +782,25 @@ class MultiEcosystemTestRunner:
                 )
             )
 
-        has_failure_text = bool(re.search(r"\b(?:FAIL|FAILED|ERROR|ERRORS)\b", text, re.IGNORECASE))
-        has_pass_text = bool(re.search(r"\b(?:PASS|PASSED|SUCCESS|OK)\b", text, re.IGNORECASE))
+        # A runner states its verdict where it finishes, so read the tail rather than the whole
+        # transcript: the body carries warnings, tracebacks and log lines whose wording has
+        # nothing to say about the outcome.
+        tail = "\n".join([line for line in text.splitlines() if line.strip()][-10:])
+
+        has_failure_text = bool(_GENERIC_FAILURE_TOKEN.search(tail))
+        has_pass_text = bool(_GENERIC_PASS_TOKEN.search(tail))
 
         if has_failure_text and not has_pass_text:
             summary = TestSummary(total=1, passed=0, failed=1, skipped=0, errors=0)
         elif has_pass_text and not has_failure_text:
             summary = TestSummary(total=1, passed=1, failed=0, skipped=0, errors=0)
         else:
-            summary = TestSummary(total=1 if (has_pass_text or has_failure_text) else 0, passed=1 if has_pass_text else 0, failed=1 if has_failure_text else 0)
+            # Both markers present, or neither: an unknown runner's output carries no verdict
+            # this parser can trust. An empty summary hands the call to run_tests, which fills
+            # it from the process exit code - the one signal here that is not a guess. The old
+            # branch instead invented total=1 with passed=1 and failed=1 set at once, so a
+            # clean run reported a failure beside its own success.
+            summary = TestSummary(total=0, passed=0, failed=0, skipped=0, errors=0)
 
         return summary, failures
 
@@ -820,8 +885,20 @@ class MultiEcosystemTestRunner:
             cmd_args = ["cmd.exe", "/c"] + cmd_args
             bin_target = "cmd.exe"
 
-        # If not an explicit path that exists on disk, check PATH
-        if not os.path.isfile(bin_target) and not os.path.isfile(os.path.join(norm_workspace, bin_target)):
+        # If not an explicit path that exists on disk, check PATH.
+        #
+        # A path that exists must still be made absolute before it is spawned. CreateProcess
+        # resolves a relative executable against the *server's* working directory and ignores
+        # the `cwd=` handed to the child, so a caller-supplied `.venv\Scripts\python.exe` - which
+        # this branch just confirmed on disk under the workspace - died with [WinError 2] the
+        # moment it reached create_subprocess_exec. Architect agents reach for exactly that
+        # relative form when they want a workspace's own interpreter.
+        ws_relative_bin = os.path.join(norm_workspace, bin_target)
+        if os.path.isfile(bin_target):
+            cmd_args[0] = os.path.abspath(bin_target)
+        elif os.path.isfile(ws_relative_bin):
+            cmd_args[0] = os.path.abspath(ws_relative_bin)
+        else:
             resolved_bin = shutil.which(bin_target, path=env.get("PATH"))
             if not resolved_bin:
                 duration = time.monotonic() - start_time

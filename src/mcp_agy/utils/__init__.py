@@ -7,6 +7,7 @@ from mcp_agy.utils.logger import (
     setup_logging,
 )
 from mcp_agy.utils.process import (
+    SubprocessOutcome,
     run_subprocess_async,
     stream_subprocess_lines,
     terminate_process_tree,
@@ -39,6 +40,7 @@ __all__ = [
     "terminate_process_tree",
     "stream_subprocess_lines",
     "run_subprocess_async",
+    "SubprocessOutcome",
     # Workspace Safety & Locking
     "WIN_SENSITIVE_ROOTS",
     "POSIX_SENSITIVE_ROOTS",

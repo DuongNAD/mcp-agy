@@ -135,8 +135,9 @@ class TestToolRegistrationAndListing:
     """Verifies that all 4 core tools are properly registered with rich docstrings."""
 
     @pytest.mark.asyncio
-    async def test_all_four_tools_registered(self, mcp_app):
-        """Verifies exactly the 4 required tools are registered."""
+    async def test_exactly_the_expected_tools_are_registered(self, mcp_app):
+        """Verifies exactly the required tools are registered - the 4 synchronous ones plus
+        the 4 that run AGY as a background job, and nothing else."""
         tools = await mcp_app.list_tools()
         tool_names = {t.name for t in tools}
         expected_names = {
@@ -144,9 +145,13 @@ class TestToolRegistrationAndListing:
             "agy_chat",
             "agy_get_diff",
             "agy_run_tests",
+            "agy_start_task",
+            "agy_job_status",
+            "agy_cancel_job",
+            "agy_list_jobs",
         }
         assert tool_names == expected_names
-        assert len(tools) == 4
+        assert len(tools) == len(expected_names)
 
     @pytest.mark.asyncio
     async def test_tool_docstrings_are_rich(self, mcp_app):

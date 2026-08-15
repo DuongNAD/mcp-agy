@@ -216,6 +216,81 @@ class ChatResult(BaseModel):
     )
 
 
+class JobHandle(BaseModel):
+    """Receipt for an AGY run that was started in the background."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["running", "error"] = Field(
+        description="'running' once the job is launched; 'error' if it could not be started at all"
+    )
+    job_id: str = Field(
+        default="",
+        description="Identifier to pass to agy_job_status and agy_cancel_job. Empty when status is 'error'",
+    )
+    kind: str = Field(
+        default="task",
+        description="What the job is doing: 'task' (accept-edits) or 'plan' (read-only)",
+    )
+    workspace_path: str = Field(default="", description="Workspace the job is running against")
+    started_at: float = Field(default=0.0, description="Unix timestamp when the job was launched")
+    error_details: Optional[str] = Field(
+        default=None,
+        description="Why the job could not be started, if status is 'error'",
+    )
+
+
+class JobStatusResult(BaseModel):
+    """State of a background AGY run, plus its result once it has finished."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["running", "completed", "failed", "cancelled", "not_found"] = Field(
+        description=(
+            "'running' if AGY is still working, 'completed' if it finished (inspect `result` for "
+            "the run's own success/error status), 'failed' if the job itself raised, 'cancelled' "
+            "if it was stopped, 'not_found' if the id is unknown - which also happens after a "
+            "server restart, since jobs live in the server process"
+        )
+    )
+    job_id: str = Field(default="", description="Identifier of the queried job")
+    kind: str = Field(default="", description="'task' (accept-edits) or 'plan' (read-only)")
+    workspace_path: str = Field(default="", description="Workspace the job ran against")
+    prompt_preview: str = Field(default="", description="First 160 characters of the job's prompt")
+    is_done: bool = Field(default=False, description="True once the job has stopped running")
+    started_at: float = Field(default=0.0, description="Unix timestamp when the job was launched")
+    finished_at: Optional[float] = Field(default=None, description="Unix timestamp when it stopped")
+    duration_seconds: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Seconds elapsed - so far if running, total if finished",
+    )
+    result: Optional[TaskExecutionResult] = Field(
+        default=None,
+        description="The completed run's full result, including modified_files and telemetry. Null while running",
+    )
+    error_details: Optional[str] = Field(
+        default=None,
+        description="Why the job failed or was cancelled, if it did not complete",
+    )
+
+
+class JobListResult(BaseModel):
+    """Every job this server process knows about, newest first."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["success"] = Field(default="success", description="Always 'success'")
+    jobs: list[JobStatusResult] = Field(
+        default_factory=list,
+        description=(
+            "Known jobs, newest first, without their results - call agy_job_status to collect "
+            "one. Finished jobs are pruned after an hour"
+        ),
+    )
+    running_count: int = Field(default=0, ge=0, description="How many jobs are still running")
+
+
 class ExecutionResult(BaseModel):
     """Comprehensive result returned from backend execution."""
 

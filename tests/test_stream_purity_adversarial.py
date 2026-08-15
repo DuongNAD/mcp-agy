@@ -200,8 +200,8 @@ class TestStdioSubprocessStreamPurity:
                 parsed = json.loads(line)
                 assert parsed.get("jsonrpc") == "2.0"
 
-    def test_all_four_tools_execution_stream_purity(self, tmp_path):
-        """Executing all 4 tools sequentially over raw stdio produces 100% valid JSON-RPC frames on stdout."""
+    def test_every_tool_execution_stream_purity(self, tmp_path):
+        """Executing every tool sequentially over raw stdio produces 100% valid JSON-RPC frames on stdout."""
         harness = StdioSubprocessHarness()
         try:
             harness.initialize_protocol()
@@ -212,7 +212,16 @@ class TestStdioSubprocessStreamPurity:
             list_data = json.loads(list_line)
             assert list_data.get("id") == list_id
             tool_names = [t["name"] for t in list_data["result"]["tools"]]
-            assert len(tool_names) == 4
+            assert set(tool_names) == {
+                "agy_execute_task",
+                "agy_chat",
+                "agy_get_diff",
+                "agy_run_tests",
+                "agy_start_task",
+                "agy_job_status",
+                "agy_cancel_job",
+                "agy_list_jobs",
+            }
 
             # 2. Call agy_chat
             chat_id = harness.send_request(
@@ -262,6 +271,49 @@ class TestStdioSubprocessStreamPurity:
             test_data = json.loads(test_line)
             assert test_data.get("id") == test_id
             assert "result" in test_data
+
+            # 6. Start a background job. Its own execution happens between frames, which is
+            # exactly where stray output would land undetected, so the frames on either side
+            # of it must still parse.
+            start_id = harness.send_request(
+                "tools/call",
+                {
+                    "name": "agy_start_task",
+                    "arguments": {
+                        "workspace_path": str(tmp_path),
+                        "prompt": "Background stream purity check",
+                    },
+                },
+            )
+            start_line = harness.read_stdout_line()
+            start_data = json.loads(start_line)
+            assert start_data.get("id") == start_id
+            job_payload = json.loads(start_data["result"]["content"][0]["text"])
+            assert job_payload["status"] == "running"
+            job_id = job_payload["job_id"]
+            assert job_id
+
+            # 7. Collect it, waiting for the mock backend to finish.
+            status_id = harness.send_request(
+                "tools/call",
+                {"name": "agy_job_status", "arguments": {"job_id": job_id, "wait_seconds": 30}},
+            )
+            status_line = harness.read_stdout_line()
+            status_data = json.loads(status_line)
+            assert status_data.get("id") == status_id
+            status_payload = json.loads(status_data["result"]["content"][0]["text"])
+            assert status_payload["status"] == "completed"
+            assert status_payload["is_done"] is True
+
+            # 8. List jobs.
+            list_jobs_id = harness.send_request(
+                "tools/call", {"name": "agy_list_jobs", "arguments": {}}
+            )
+            list_jobs_line = harness.read_stdout_line()
+            list_jobs_data = json.loads(list_jobs_line)
+            assert list_jobs_data.get("id") == list_jobs_id
+            jobs_payload = json.loads(list_jobs_data["result"]["content"][0]["text"])
+            assert [j["job_id"] for j in jobs_payload["jobs"]] == [job_id]
         finally:
             stdout_rem, stderr_out = harness.close()
 
@@ -270,6 +322,8 @@ class TestStdioSubprocessStreamPurity:
         assert "agy_execute_task invoked" in stderr_out
         assert "agy_get_diff invoked" in stderr_out
         assert "agy_run_tests invoked" in stderr_out
+        assert "agy_start_task invoked" in stderr_out
+        assert "Started background job" in stderr_out
 
         # Verify no trailing non-JSON on stdout
         if stdout_rem.strip():
@@ -388,7 +442,7 @@ class TestFaultInjectionAndErrorResilience:
 
         # Server is still healthy and responsive
         tools = await server.list_tools()
-        assert len(tools) == 4
+        assert {t.name for t in tools} >= {"agy_execute_task", "agy_chat", "agy_start_task"}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

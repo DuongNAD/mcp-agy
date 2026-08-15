@@ -372,6 +372,108 @@ class TestDiagnosticsParsers:
         assert not _PYTEST_SUMMARY_LINE.search("=== Benchmark Results ===\n=== Done ===\n")
         assert _PYTEST_SUMMARY_LINE.search("==== 5 passed in 0.12s ====")
 
+    def test_custom_sniffer_recognizes_quiet_mode_pytest_output(self):
+        """`pytest -q` prints its counts with no surrounding rule.
+
+        Regression, reproduced against this repo's own suite: only the banner form was
+        matched, so a custom `test_command` carrying -q fell through to the generic parser,
+        which found the word "fail" inside an unrelated pydantic warning. A clean 22-passed
+        run came back as passed=1 beside failed=1, contradicting its own exit code of 0.
+        """
+        runner = MultiEcosystemTestRunner()
+        sample_output = (
+            "......................                                                   [100%]\n"
+            "============================== warnings summary ===============================\n"
+            "pydantic_settings/sources/utils.py:47: IncompleteFieldDefinitionWarning: Field\n"
+            "  'lifespan' has an incomplete definition: its annotation contains an unresolved\n"
+            "  forward reference, so settings sources may fail to correctly resolve its value.\n"
+            "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
+            "22 passed, 1 warning in 6.69s\n"
+        )
+        summary, _ = runner.parse_diagnostics("custom", sample_output)
+        assert summary.passed == 22, "quiet-mode pytest output was not routed to the pytest parser"
+        assert summary.failed == 0, "prose in a warning was read as a failure"
+        assert summary.total == 22
+
+    def test_custom_sniffer_reads_quiet_output_of_a_run_past_a_minute(self):
+        """Past 60s pytest appends a clock reading after the duration."""
+        runner = MultiEcosystemTestRunner()
+        summary, _ = runner.parse_diagnostics(
+            "custom", "380 passed, 1 warning in 61.00s (0:01:01)\n"
+        )
+        assert summary.passed == 380
+        assert summary.total == 380
+
+    def test_generic_parser_ignores_the_word_fail_in_prose(self):
+        """An unknown runner's verdict is shouted; prose that says "fail" is not a verdict."""
+        runner = MultiEcosystemTestRunner()
+        summary, _ = runner.parse_diagnostics(
+            "custom", "starting run\nthe cache may fail to warm up\nAll checks OK\n"
+        )
+        assert summary.passed == 1
+        assert summary.failed == 0
+
+    def test_generic_parser_leaves_an_ambiguous_verdict_to_the_exit_code(self):
+        """Both markers at once is not a verdict: an empty summary defers to run_tests.
+
+        The old branch set passed=1 and failed=1 together under total=1, so the counts did
+        not even add up to their own total.
+        """
+        runner = MultiEcosystemTestRunner()
+        summary, _ = runner.parse_diagnostics("custom", "PASSED stage one\nFAILED stage two\n")
+        assert summary.total == 0
+        assert summary.passed == 0
+        assert summary.failed == 0
+
+    def test_vitest_counts_are_read_not_guessed(self):
+        """Vitest writes its total in parentheses and omits Jest's colon and "N total".
+
+        Captured live from `npx vitest run` against E:\\Project\\LIVA\\liva-ui: none of the Jest
+        patterns match this, so a real 27-test run fell through to the generic parser and came
+        back as `total: 1, passed: 1` - true about the outcome, silent about the suite.
+        """
+        runner = MultiEcosystemTestRunner()
+        sample_output = (
+            "RUN  v4.1.5 E:/Project/LIVA/liva-ui\n"
+            "\n"
+            " x tests/composables/useGateway.test.ts (27 tests) 191ms\n"
+            "\n"
+            " Test Files  1 passed (1)\n"
+            "      Tests  27 passed (27)\n"
+            "   Start at  23:21:22\n"
+            "   Duration  15.28s (transform 111ms, setup 686ms)\n"
+        )
+        summary, _ = runner.parse_diagnostics("custom", sample_output)
+        assert summary.total == 27, "vitest output was not routed to the jest/vitest parser"
+        assert summary.passed == 27
+        assert summary.failed == 0
+
+    def test_vitest_failure_counts_are_split_correctly(self):
+        """A mixed vitest run separates its counts with a pipe, not a comma."""
+        runner = MultiEcosystemTestRunner()
+        summary, _ = runner.parse_diagnostics(
+            "npm",
+            " Test Files  1 failed | 3 passed (4)\n"
+            "      Tests  2 failed | 1 skipped | 24 passed (27)\n",
+        )
+        assert summary.total == 27
+        assert summary.passed == 24
+        assert summary.failed == 2
+        assert summary.skipped == 1
+
+    def test_jest_output_still_parses_after_the_vitest_branch(self):
+        """The Jest form must keep working: its summary has a colon and an explicit total."""
+        runner = MultiEcosystemTestRunner()
+        summary, _ = runner.parse_diagnostics(
+            "npm",
+            "Test Suites: 1 failed, 4 passed, 5 total\n"
+            "Tests:       3 failed, 2 skipped, 45 passed, 50 total\n",
+        )
+        assert summary.total == 50
+        assert summary.passed == 45
+        assert summary.failed == 3
+        assert summary.skipped == 2
+
     def test_parse_cargo_aggregates_all_test_binaries(self):
         """One `test result:` line is emitted per test binary and all of them must be counted.
 
@@ -554,6 +656,41 @@ class TestExecutionEnvironmentAndProcessSafety:
 
         assert os.path.isabs(captured["cmd"][0])
         assert captured["cmd"][1:] == ["--version"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_relative_executable_is_spawned_by_absolute_path(self, tmp_path, monkeypatch):
+        """An executable that exists only under the workspace must still spawn.
+
+        Regression: CreateProcess resolves a relative executable against the server's own
+        working directory and ignores the `cwd=` handed to the child, so a caller-supplied
+        `.venv\\Scripts\\python.exe` - confirmed on disk by this very branch - reached
+        create_subprocess_exec unchanged and died with [WinError 2].
+        """
+        bin_name = "Scripts" if os.name == "nt" else "bin"
+        bin_dir = tmp_path / ".venv" / bin_name
+        bin_dir.mkdir(parents=True)
+        fake_exe = bin_dir / ("python.exe" if os.name == "nt" else "python")
+        fake_exe.write_text("", encoding="utf-8")
+        relative_cmd = os.path.join(".venv", bin_name, fake_exe.name)
+
+        captured: dict[str, list[str]] = {}
+
+        async def _fake_run(cmd, cwd, env, timeout_seconds):
+            captured["cmd"] = list(cmd)
+            return 0, "", ""
+
+        monkeypatch.setattr("mcp_agy.core.test_runner.run_subprocess_async", _fake_run)
+        # Stand somewhere the relative path does not resolve, which is the whole point:
+        # only workspace_path gives it meaning.
+        monkeypatch.chdir(tmp_path.parent)
+
+        runner = MultiEcosystemTestRunner()
+        res = await runner.run_tests(str(tmp_path), test_command=f"{relative_cmd} -m pytest")
+
+        assert res.status != "error", f"relative executable was rejected: {res.error_details}"
+        assert os.path.isabs(captured["cmd"][0])
+        assert os.path.normcase(captured["cmd"][0]) == os.path.normcase(str(fake_exe))
+        assert captured["cmd"][1:] == ["-m", "pytest"]
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(os.name != "nt", reason="PATHEXT launcher resolution is Windows-specific")

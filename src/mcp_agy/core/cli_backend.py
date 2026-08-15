@@ -27,7 +27,7 @@ from mcp_agy.core.models import (
     ToolStatus,
 )
 from mcp_agy.utils.logger import get_logger
-from mcp_agy.utils.process import stream_subprocess_lines
+from mcp_agy.utils.process import SubprocessOutcome, stream_subprocess_lines
 
 logger = get_logger("mcp_agy.core.cli_backend")
 
@@ -339,6 +339,8 @@ class SubprocessCLIBackend(AGYBackend):
         modified_files: Set[str] = set()
         tool_calls: List[ToolEvent] = []
         error_details: Optional[str] = None
+        tool_errors: List[str] = []
+        saw_result_event = False
 
         if not self.is_available():
             return ExecutionResult(
@@ -366,11 +368,13 @@ class SubprocessCLIBackend(AGYBackend):
             if (request.workspace_path and os.path.isdir(request.workspace_path))
             else None
         )
+        outcome = SubprocessOutcome()
         try:
             async for line in stream_subprocess_lines(
                 cmd,
                 cwd=valid_cwd,
                 timeout_seconds=float(request.timeout_seconds),
+                outcome=outcome,
             ):
                 try:
                     event_data = json.loads(line)
@@ -431,6 +435,30 @@ class SubprocessCLIBackend(AGYBackend):
                                     )
                                 )
 
+                            elif state in ("ERROR", "FAILED"):
+                                # A tool that fails is reported here and nowhere else: the run
+                                # can still end on `result.status: SUCCESS` with an empty
+                                # response, which is how a permission denial reached the
+                                # architect as a successful call that simply said nothing.
+                                params = _safe_dict(tool_info.get("parameters"))
+                                err_msg = str(
+                                    _safe_dict(tool_info.get("error")).get("message") or ""
+                                ).strip()
+                                tool_calls.append(
+                                    ToolEvent(
+                                        tool_name=tool_name,
+                                        tool_call_id=str(step.get("step_index") or ""),
+                                        status=ToolStatus.FAILED,
+                                        arguments=params,
+                                        output=None,
+                                        duration_seconds=_safe_float(step.get("duration_seconds")),
+                                        error=err_msg or None,
+                                    )
+                                )
+                                tool_errors.append(
+                                    f"{tool_name}: {err_msg}" if err_msg else f"{tool_name}: failed"
+                                )
+
                         elif step_type == "agent_response" and "text_delta" in step:
                             raw_delta = step.get("text_delta")
                             if raw_delta is not None:
@@ -443,10 +471,20 @@ class SubprocessCLIBackend(AGYBackend):
 
                     elif event_type == "result":
                         res = _safe_dict(event_data.get("result"))
+                        saw_result_event = True
                         if not conv_id:
                             conv_id = str(res.get("conversation_id") or "")
                         raw_status = str(res.get("status") or "SUCCESS").upper()
                         status = "success" if raw_status == "SUCCESS" else "error"
+                        if status == "error":
+                            # The CLI puts the reason in `result.error` - an invalid model or
+                            # effort selection, a refused workspace, an auth failure. Dropping
+                            # it left the architect holding status="error" and error_details
+                            # null: a failure with nothing to act on.
+                            error_details = (
+                                str(res.get("error") or "").strip()
+                                or f"agy CLI reported status {raw_status} without an error message."
+                            )
                         if "response" in res and res["response"] is not None:
                             final_response_chunks = [str(res["response"])]
                         if "usage" in res:
@@ -471,7 +509,10 @@ class SubprocessCLIBackend(AGYBackend):
                 session_id=conv_id,
                 modified_files=sorted(list(modified_files)),
                 diff_summary=f"{len(modified_files)} file(s) modified before timeout",
-                error_message=f"Subprocess execution timed out after {request.timeout_seconds} seconds",
+                error_message=(
+                    f"Subprocess execution timed out after {request.timeout_seconds} seconds"
+                    + (f". agy stderr: {outcome.stderr_tail}" if outcome.stderr_tail else "")
+                ),
             )
         except Exception as e:
             duration = time.monotonic() - start_time
@@ -494,6 +535,26 @@ class SubprocessCLIBackend(AGYBackend):
         duration = time.monotonic() - start_time
         response_text = "".join(final_response_chunks)
         diff_summary = f"Modified {len(modified_files)} file(s)" if modified_files else "No files modified"
+
+        # A run that answered nothing, changed nothing and reported SUCCESS is not a success -
+        # it is a failure whose evidence landed somewhere this parser used to ignore. Seen live:
+        # agy denied its own `run_command` under headless permissions, wrote the reason to
+        # stderr, then emitted `result.status: SUCCESS` with an empty response. Only claim an
+        # error when there is evidence for one; an empty answer with nothing else wrong stays
+        # a success, as it always was.
+        if status == "success" and not response_text.strip() and not modified_files:
+            evidence: List[str] = []
+            if tool_errors:
+                evidence.append("Tools that failed during the run: " + "; ".join(tool_errors[:5]))
+            if outcome.stderr_tail:
+                evidence.append(f"agy stderr: {outcome.stderr_tail}")
+            if outcome.returncode not in (None, 0):
+                evidence.append(f"agy exited with code {outcome.returncode}")
+            elif not saw_result_event:
+                evidence.append("agy produced no result event")
+            if evidence:
+                status = "error"
+                error_details = "AGY returned an empty response. " + " | ".join(evidence)
 
         return ExecutionResult(
             success=(status == "success"),
