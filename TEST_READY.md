@@ -13,8 +13,8 @@
 | **Tier 3: Cross-Feature** | 8 | Pairwise multi-tool workflows, closed-loop debugging, multi-turn chat, 4-tool integration | $\ge 6$ | **PASSED** |
 | **Tier 4: Real-World Scenarios** | 6 | Full stdio subprocess lifecycle, Claude/Cursor architect simulation, hybrid multi-language projects, legacy refactor | $\ge 5$ | **PASSED** |
 | **Total E2E Tests** | **72** | **Requirement-driven, opaque-box test suite** | **$\ge 51$** | **PASSED** |
-| Supporting Protocol, Adversarial & Engine Tests | 336 | FastMCP protocol frames, fallback hierarchy, NDJSON parser, stream purity, env-var configuration, framework detection, subprocess stderr handling, background job lifecycle, adversarial stress tests | N/A | **PASSED** |
-| **Grand Total Matrix** | **408** | **Complete project test suite (100% passed, 0 xfailed)** | N/A | **PASSED** |
+| Supporting Protocol, Adversarial & Engine Tests | 337 | FastMCP protocol frames, fallback hierarchy, NDJSON parser, stream purity, env-var configuration, shipped-config integrity, framework detection, subprocess stderr handling, background job lifecycle, adversarial stress tests | N/A | **PASSED** |
+| **Grand Total Matrix** | **409** | **Complete project test suite (100% passed, 0 xfailed)** | N/A | **PASSED** |
 
 ## Live Integration Verification (real `agy.EXE`, not mock)
 

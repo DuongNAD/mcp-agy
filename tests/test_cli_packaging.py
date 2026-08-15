@@ -301,13 +301,14 @@ class TestPackagingMetadataAndIntegrity:
         assert "click" in content
 
     def test_client_configs_are_valid_json(self):
-        """Verifies all 4 client config files in configs/ exist and are valid JSON."""
+        """Verifies all 5 client config files in configs/ exist and are valid JSON."""
         repo_root = Path(__file__).parent.parent
         config_files = [
             "configs/claude_desktop_config.json",
             "configs/cursor_mcp.json",
             "configs/cline_mcp_settings.json",
             "configs/roo_code_mcp_settings.json",
+            "configs/claude_code_mcp.json",
         ]
         for cfg in config_files:
             cfg_path = repo_root / cfg
@@ -318,6 +319,24 @@ class TestPackagingMetadataAndIntegrity:
             assert "mcp-agy" in parsed["mcpServers"]
             server_cfg = parsed["mcpServers"]["mcp-agy"]
             assert "command" in server_cfg
+
+    def test_claude_code_config_raises_the_call_timeout(self):
+        """Verifies the Claude Code config still carries a timeout above the client default.
+
+        Claude Code caps a single tool call at 60s unless the server entry raises it, and a
+        real AGY task runs for minutes. Without this key every long call dies with
+        `Error: Request timed out` and the work is discarded -- the reason this config file
+        exists at all. A silent drop of the key would restore that failure with no test to
+        notice, so the value is asserted, not merely its presence.
+        """
+        repo_root = Path(__file__).parent.parent
+        parsed = json.loads((repo_root / "configs/claude_code_mcp.json").read_text(encoding="utf-8"))
+        timeout_ms = parsed["mcpServers"]["mcp-agy"].get("timeout")
+        assert timeout_ms is not None, "claude_code_mcp.json must set an explicit timeout"
+        assert timeout_ms > 60_000, (
+            f"timeout {timeout_ms}ms is at or below Claude Code's 60s default, "
+            "so a real AGY task would still be cut off"
+        )
 
     def test_main_module_delegates_to_cli_main(self):
         """Verifies mcp_agy.__main__ imports cli.main."""
@@ -463,6 +482,7 @@ class TestEnvironmentVariableConfiguration:
             "configs/cursor_mcp.json",
             "configs/cline_mcp_settings.json",
             "configs/roo_code_mcp_settings.json",
+            "configs/claude_code_mcp.json",
         ):
             parsed = json.loads((repo_root / cfg).read_text(encoding="utf-8"))
             env_block = parsed["mcpServers"]["mcp-agy"].get("env", {})
