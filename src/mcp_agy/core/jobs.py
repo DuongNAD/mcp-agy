@@ -17,6 +17,9 @@ for the architect to notice and re-issue rather than wait forever on an id that 
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
+import tempfile
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -36,10 +39,35 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 
 
+def _marker_dir() -> Path:
+    """Where completion markers land. `MCP_AGY_JOB_MARKER_DIR` redirects it.
+
+    The override exists because `reset()` cannot catch every marker: a job that finishes *after*
+    the registry is cleared still writes one, and the test suite resets between cases. Cleaning
+    on reset took a full run from ~700 stray files down to 317 - better, but 317 a run into a
+    directory shared by every run on the machine is still litter. Pointing the tests at their
+    own directory makes it zero, which is the only number that stays true over time.
+    """
+    override = os.environ.get("MCP_AGY_JOB_MARKER_DIR")
+    d = Path(override) if override else Path(tempfile.gettempdir()) / "mcp_agy_jobs"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning(f"Could not create marker directory {d}: {exc}")
+    return d
+
+
 class JobRecord:
     """One AGY run and everything known about it, before and after it finishes."""
 
-    def __init__(self, job_id: str, kind: str, workspace_path: str, prompt: str) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        kind: str,
+        workspace_path: str,
+        prompt: str,
+        done_marker_path: str = "",
+    ) -> None:
         self.job_id = job_id
         self.kind = kind
         self.workspace_path = workspace_path
@@ -52,6 +80,7 @@ class JobRecord:
         self.result: Any = None
         self.error_details: Optional[str] = None
         self.task: Optional[asyncio.Task[Any]] = None
+        self.done_marker_path = done_marker_path
 
     @property
     def is_done(self) -> bool:
@@ -78,11 +107,14 @@ class JobManager:
     ) -> JobRecord:
         """Launch `runner` in the background and return its record immediately."""
         self._prune()
+        job_id = str(uuid.uuid4())
+        done_marker_path = str(_marker_dir() / f"{job_id}.done")
         job = JobRecord(
-            job_id=str(uuid.uuid4()),
+            job_id=job_id,
             kind=kind,
             workspace_path=workspace_path,
             prompt=prompt,
+            done_marker_path=done_marker_path,
         )
         self._jobs[job.job_id] = job
 
@@ -104,6 +136,15 @@ class JobManager:
             finally:
                 if job.finished_at is None:
                     job.finished_at = time.time()
+                if job.done_marker_path:
+                    try:
+                        p = Path(job.done_marker_path)
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(f"{job.status}\n", encoding="utf-8")
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed to write done marker for job {job.job_id} at {job.done_marker_path}: {exc}"
+                        )
 
         # The registry holds the only strong reference to this task. Without it the event loop
         # may garbage-collect a running task mid-flight.
@@ -157,6 +198,13 @@ class JobManager:
             job.finished_at = time.time()
         return job
 
+    def _delete_marker(self, job: JobRecord) -> None:
+        if job.done_marker_path:
+            try:
+                Path(job.done_marker_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def _prune(self) -> None:
         """Drop finished jobs that are old or in excess. Running jobs are never dropped."""
         now = time.time()
@@ -164,6 +212,7 @@ class JobManager:
         for job in finished:
             if job.finished_at is not None and (now - job.finished_at) > COMPLETED_JOB_TTL_SECONDS:
                 self._jobs.pop(job.job_id, None)
+                self._delete_marker(job)
 
         finished = sorted(
             (j for j in self._jobs.values() if j.is_done),
@@ -172,9 +221,19 @@ class JobManager:
         excess = len(finished) - MAX_COMPLETED_JOBS
         for job in finished[: max(0, excess)]:
             self._jobs.pop(job.job_id, None)
+            self._delete_marker(job)
 
     def reset(self) -> None:
-        """Drop every job without cancelling. For tests."""
+        """Drop every job without cancelling. For tests.
+
+        Deletes the markers too. `_prune` already does this on the paths it owns, but `reset`
+        is the path the test suite takes between cases, and it used to clear the registry while
+        leaving the files behind: one full run left ~700 markers in a temp directory shared by
+        every run on the machine, and 2 217 had piled up before anyone counted. A cleanup that
+        only fires in production is not cleanup.
+        """
+        for job in list(self._jobs.values()):
+            self._delete_marker(job)
         self._jobs.clear()
 
 

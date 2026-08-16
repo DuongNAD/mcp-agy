@@ -234,6 +234,10 @@ class JobHandle(BaseModel):
     )
     workspace_path: str = Field(default="", description="Workspace the job is running against")
     started_at: float = Field(default=0.0, description="Unix timestamp when the job was launched")
+    done_marker_path: str = Field(
+        default="",
+        description="The file that appears when this job reaches a terminal state; wait on it instead of polling, e.g. `until [ -f <path> ]; do sleep 5; done`.",
+    )
     error_details: Optional[str] = Field(
         default=None,
         description="Why the job could not be started, if status is 'error'",

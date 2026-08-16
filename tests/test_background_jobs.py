@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, Dict
 
 import pytest
@@ -335,6 +336,113 @@ class TestBackgroundJobTools:
             listing = _payload(await session.call_tool("agy_list_jobs", {}))
             assert listing["jobs"] == []
 
+    async def test_completed_job_writes_marker_and_matches_handle_path(
+        self, client_factory, git_workspace
+    ):
+        """A completed job writes 'completed' to the marker path returned in JobHandle."""
+        executor = _ControllableExecutor()
+        server = create_mcp_server(backend_executor=executor)
+
+        async with client_factory(server) as session:
+            handle = _payload(
+                await session.call_tool(
+                    "agy_start_task",
+                    {"workspace_path": str(git_workspace), "prompt": "Marker completed test"},
+                )
+            )
+            marker_path = Path(handle["done_marker_path"])
+            assert handle["done_marker_path"], "JobHandle must populate done_marker_path"
+            assert not marker_path.exists(), "Marker must not exist while job is running"
+
+            executor.release.set()
+            done = _payload(
+                await session.call_tool(
+                    "agy_job_status", {"job_id": handle["job_id"], "wait_seconds": 5}
+                )
+            )
+            assert done["status"] == "completed"
+            assert marker_path.is_file(), "Marker file must appear at the path in JobHandle"
+            assert marker_path.read_text(encoding="utf-8").strip() == "completed"
+
+    async def test_failed_job_writes_marker_containing_failed(
+        self, client_factory, git_workspace
+    ):
+        """A failed job writes 'failed' so silence never means 'crashed'."""
+        async def _explode(**_: Any) -> TaskExecutionResult:
+            raise RuntimeError("agy subprocess crashed unexpectedly")
+
+        server = create_mcp_server(backend_executor=_explode)
+
+        async with client_factory(server) as session:
+            handle = _payload(
+                await session.call_tool(
+                    "agy_start_task",
+                    {"workspace_path": str(git_workspace), "prompt": "Marker failed test"},
+                )
+            )
+            marker_path = Path(handle["done_marker_path"])
+            assert handle["done_marker_path"]
+
+            status = _payload(
+                await session.call_tool(
+                    "agy_job_status", {"job_id": handle["job_id"], "wait_seconds": 5}
+                )
+            )
+            assert status["status"] == "failed"
+            assert marker_path.is_file(), "Marker file must appear when the job fails"
+            assert marker_path.read_text(encoding="utf-8").strip() == "failed"
+
+    async def test_cancelled_job_writes_marker_containing_cancelled(
+        self, client_factory, git_workspace
+    ):
+        """A cancelled job writes 'cancelled' into its marker file."""
+        executor = _ControllableExecutor()
+        server = create_mcp_server(backend_executor=executor)
+
+        async with client_factory(server) as session:
+            handle = _payload(
+                await session.call_tool(
+                    "agy_start_task",
+                    {"workspace_path": str(git_workspace), "prompt": "Marker cancelled test"},
+                )
+            )
+            marker_path = Path(handle["done_marker_path"])
+            assert handle["done_marker_path"]
+            await executor.started.wait()
+
+            cancelled = _payload(
+                await session.call_tool("agy_cancel_job", {"job_id": handle["job_id"]})
+            )
+            assert cancelled["status"] == "cancelled"
+            assert marker_path.is_file(), "Marker file must appear when the job is cancelled"
+            assert marker_path.read_text(encoding="utf-8").strip() == "cancelled"
+
+    async def test_wait_seconds_schema_boundary(self, client_factory, git_workspace):
+        """wait_seconds=600 is accepted by the schema and 601 is rejected."""
+        server = create_mcp_server(backend_executor=_ControllableExecutor())
+
+        async with client_factory(server) as session:
+            # 600 is accepted (returns valid status result, here not_found for dummy id)
+            call_600 = await session.call_tool(
+                "agy_job_status", {"job_id": "00000000-dead-beef", "wait_seconds": 600}
+            )
+            assert not getattr(call_600, "isError", False)
+            res_600 = _payload(call_600)
+            assert res_600["status"] == "not_found"
+
+            # 601 is rejected by schema validation
+            call_601 = await session.call_tool(
+                "agy_job_status", {"job_id": "00000000-dead-beef", "wait_seconds": 601}
+            )
+            assert getattr(call_601, "isError", False) is True
+            assert "600" in call_601.content[0].text
+
+        # Directly calling the FastMCP server tool raises on 601
+        with pytest.raises(Exception):
+            await server.call_tool(
+                "agy_job_status", {"job_id": "00000000-dead-beef", "wait_seconds": 601}
+            )
+
 
 @pytest.mark.anyio
 class TestJobManagerHousekeeping:
@@ -379,3 +487,30 @@ class TestJobManagerHousekeeping:
         release.set()
         assert long_job.task is not None
         await long_job.task
+
+    async def test_pruning_finished_job_removes_marker_file(self):
+        """When _prune() drops an old finished job, its marker file is removed from disk."""
+        manager = JobManager()
+
+        async def _instant() -> TaskExecutionResult:
+            return TaskExecutionResult(status="success", response="ok")
+
+        job = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="job 0")
+        assert job.task is not None
+        await job.task
+
+        marker = Path(job.done_marker_path)
+        assert marker.is_file(), "Marker file must exist after job completes"
+        assert marker.read_text(encoding="utf-8").strip() == "completed"
+
+        # Create excess jobs to force the first job to be pruned
+        for i in range(110):
+            j = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt=f"job {i+1}")
+            assert j.task is not None
+            await j.task
+
+        # Trigger prune via one more start
+        manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="trigger")
+
+        assert manager.get(job.job_id) is None, "The first job should have been pruned"
+        assert not marker.exists(), "The pruned job's marker file must be deleted from disk"

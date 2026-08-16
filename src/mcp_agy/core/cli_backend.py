@@ -27,10 +27,15 @@ from mcp_agy.core.models import (
     ToolStatus,
 )
 from mcp_agy.utils.logger import get_logger
-from mcp_agy.utils.process import SubprocessOutcome, stream_subprocess_lines
+from mcp_agy.utils.process import SubprocessOutcome, run_subprocess_async, stream_subprocess_lines
 
 logger = get_logger("mcp_agy.core.cli_backend")
 
+# Tool names whose parameters name a file the run is about to write. This is a *hint*, not the
+# record: it is an allow-list of another program's tool names, so it goes stale the moment agy
+# renames one or adds another, and it never sees a write that arrives some other way - a shell
+# redirect, `sed -i` inside `run_command`, a patch applied by a tool not listed here. Ground
+# truth comes from `_detect_changed_files` below; this set only makes the common case cheap.
 FILE_MODIFICATION_TOOLS: Set[str] = {
     "write_to_file",
     "replace_file_content",
@@ -38,6 +43,71 @@ FILE_MODIFICATION_TOOLS: Set[str] = {
     "sed_file",
     "notebook_edit",
 }
+
+
+async def _detect_changed_files(workspace_path: str, since_wall_ts: float) -> Set[str]:
+    """Ask git what this run actually touched, whatever tool did the touching.
+
+    Why this exists: reporting `modified_files: []` for a run that rewrote four files is worse
+    than reporting nothing at all, because the caller acts on it - it concludes the workspace is
+    clean and moves on. That happened: a timed-out run reported zero while +203 lines sat on
+    disk, because every write had gone through a tool absent from FILE_MODIFICATION_TOOLS.
+
+    Method: everything git currently calls dirty or untracked, narrowed to entries whose mtime
+    is at or after the run's start. The mtime filter is what separates "this run wrote it" from
+    "it was already dirty when we got here" - a workspace mid-edit is the normal case, not the
+    exception, and claiming its pre-existing changes would be its own kind of lie.
+
+    Never raises: a workspace that is not a repo, a missing git, a hostile path - all resolve to
+    the empty set, leaving the stream-derived hint as the only evidence. Silence here degrades
+    the report; an exception would fail the run.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return set()
+
+    # `or "git"` matters: `shutil.which` searches PATH, and this server is routinely launched by
+    # a client that hands it almost no environment. Falling back to the bare name lets the OS
+    # resolve it the way `diff_engine` already does - the first version of this function bailed
+    # out on a None from `which` and reported "no files changed" for a run that had changed some.
+    git_cmd = shutil.which("git") or "git"
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"  # never block waiting for credentials
+    env["GIT_OPTIONAL_LOCKS"] = "0"  # read-only: do not fight a concurrent git for the index lock
+    env["LC_ALL"] = "C"  # stable, parseable output regardless of the user's locale
+
+    try:
+        code, raw_out, _ = await run_subprocess_async(
+            [git_cmd, "status", "--porcelain=v1", "-uall"],
+            cwd=workspace_path,
+            env=env,
+            timeout_seconds=20.0,
+        )
+    except Exception as exc:  # not a repo, git missing, cwd vanished, timeout
+        logger.debug(f"Change detection skipped for '{workspace_path}': {exc}")
+        return set()
+
+    if code != 0:
+        return set()
+
+    changed: Set[str] = set()
+    for line in raw_out.splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:].strip()
+        # Renames arrive as `old -> new`; the new path is the one that exists on disk.
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        entry = entry.strip('"')
+        if not entry or entry.endswith("/"):
+            continue
+        try:
+            if os.path.getmtime(os.path.join(workspace_path, entry)) + 1.0 >= since_wall_ts:
+                changed.add(entry.replace("\\", "/"))
+        except OSError:
+            # Deleted during the run: git still lists it, the stat fails. A deletion is a change,
+            # and its timing cannot be recovered, so report it rather than drop it.
+            changed.add(entry.replace("\\", "/"))
+    return changed
 
 
 def find_agy_executable() -> Optional[str]:
@@ -332,6 +402,8 @@ class SubprocessCLIBackend(AGYBackend):
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
         """Execute a full autonomous request to completion via agy CLI."""
         start_time = time.monotonic()
+        # Wall clock too: monotonic cannot be compared against a file's mtime.
+        wall_start = time.time()
         conv_id = request.session_id
         final_response_chunks: List[str] = []
         status = "success"
@@ -497,6 +569,9 @@ class SubprocessCLIBackend(AGYBackend):
 
         except asyncio.TimeoutError:
             duration = time.monotonic() - start_time
+            # The path that most needs the truth: agy was killed mid-run, so the stream stopped
+            # wherever it stopped, and whatever it had already written is still on disk.
+            modified_files |= await _detect_changed_files(request.workspace_path, wall_start)
             return ExecutionResult(
                 success=False,
                 status="timeout",
@@ -517,6 +592,7 @@ class SubprocessCLIBackend(AGYBackend):
         except Exception as e:
             duration = time.monotonic() - start_time
             logger.exception(f"CLI backend execution failed: {e}")
+            modified_files |= await _detect_changed_files(request.workspace_path, wall_start)
             return ExecutionResult(
                 success=False,
                 status="error",
@@ -534,6 +610,9 @@ class SubprocessCLIBackend(AGYBackend):
 
         duration = time.monotonic() - start_time
         response_text = "".join(final_response_chunks)
+        # Also on the success path: a run can finish cleanly having written through a tool this
+        # parser does not recognise, and "No files modified" would be just as wrong there.
+        modified_files |= await _detect_changed_files(request.workspace_path, wall_start)
         diff_summary = f"Modified {len(modified_files)} file(s)" if modified_files else "No files modified"
 
         # A run that answered nothing, changed nothing and reported SUCCESS is not a success -

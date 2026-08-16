@@ -531,15 +531,17 @@ def create_mcp_server(
             "Starts an AGY coding or analysis run in the background and returns a job id immediately.\n\n"
             "Use this instead of `agy_execute_task` for anything that takes more than about half a "
             "minute - which is most real work. Every MCP client caps how long it waits for a single "
-            "tool call (Claude Code: 60 seconds by default, a hard wall-clock limit), so a synchronous "
-            "call to a task that runs for minutes is dropped by the client and its work is lost. This "
-            "tool returns at once; AGY keeps working in the server; you collect the result later with "
-            "`agy_job_status`.\n\n"
+            "tool call (Claude Code: 60 seconds by default, configurable higher; shipped configs use "
+            "30 minutes), so a synchronous call to a task that runs for minutes is dropped by the "
+            "client and its work is lost. This tool returns at once; AGY keeps working in the server; "
+            "you collect the result later with `agy_job_status`.\n\n"
             "Architect Guidance:\n"
             "- Start the job, then do something else - inspect files, plan the next step, start another "
             "job in a different workspace - and collect the result when you need it.\n"
-            "- `agy_job_status(job_id, wait_seconds=30)` blocks briefly and returns as soon as the job "
-            "finishes, so a short job needs no polling loop.\n"
+            "- The recommended way to wait on completion is checking the `done_marker_path` file on disk "
+            "(e.g. `until [ -f <path> ]; do sleep 5; done`) rather than polling `agy_job_status` repeatedly, "
+            "then calling `agy_job_status` once to collect the result.\n"
+            "- Alternatively, pass `wait_seconds` to `agy_job_status` to block until the job finishes.\n"
             "- mode='plan' is the read-only form: AGY investigates and reports without touching files.\n"
             "- Jobs live in the server process. If the server restarts, `agy_job_status` reports "
             "'not_found' and the run must be re-issued.\n\n"
@@ -550,7 +552,7 @@ def create_mcp_server(
             "    mode: 'accept-edits' for full coding/editing (default), or 'plan' for read-only analysis.\n"
             "    timeout_seconds: Maximum execution time for the run itself (default: 600s, max: 3600).\n\n"
             "Returns:\n"
-            "    JobHandle containing status, job_id, kind, workspace_path, started_at, and error_details."
+            "    JobHandle containing status, job_id, kind, workspace_path, started_at, done_marker_path, and error_details."
         ),
     )
     async def agy_start_task(
@@ -663,6 +665,7 @@ def create_mcp_server(
             kind=job.kind,
             workspace_path=job.workspace_path,
             started_at=job.started_at,
+            done_marker_path=job.done_marker_path,
         )
 
     @server.tool(
@@ -671,14 +674,15 @@ def create_mcp_server(
             "Checks a background AGY job and returns its full result once it has finished.\n\n"
             "Architect Guidance:\n"
             "- Pass `wait_seconds` to block until the job finishes instead of polling: the call returns "
-            "the moment the job is done, or at the deadline with status still 'running'. Keep it below "
-            "your client's per-call cap (Claude Code: 60s by default) - 30 is a safe default.\n"
+            "the moment the job is done, or at the deadline with status still 'running'. Keep `wait_seconds` "
+            "below whatever per-call cap your client enforces (the shipped Claude Code config raises this "
+            "to 30 minutes, but a client left at its 60-second default will drop a long wait).\n"
             "- `status: 'completed'` means the job ran to completion; read `result.status` for whether "
             "AGY itself succeeded, and `result.modified_files` for what it changed.\n"
             "- 'not_found' means the id is unknown to this server - typically because it restarted.\n\n"
             "Args:\n"
             "    job_id: Identifier returned by agy_start_task.\n"
-            "    wait_seconds: Seconds to wait for completion before returning (default: 0, max: 45).\n\n"
+            "    wait_seconds: Seconds to wait for completion before returning (default: 0, max: 600).\n\n"
             "Returns:\n"
             "    JobStatusResult containing status, is_done, duration_seconds, result, and error_details."
         ),
@@ -692,8 +696,14 @@ def create_mcp_server(
             int,
             Field(
                 ge=0,
-                le=45,
-                description="Block up to this many seconds waiting for the job to finish, returning early the moment it does. 0 (default) reports the current state immediately. Capped at 45 so this call always returns inside a client's per-call timeout.",
+                le=600,
+                description=(
+                    "Block up to this many seconds waiting for the job to finish, returning early the "
+                    "moment it does. 0 (default) reports the current state immediately. The ceiling exists "
+                    "because the call must return inside whatever cap the client enforces; the shipped Claude "
+                    "Code config raises that to 30 minutes, but a client left at its 60-second default will still "
+                    "drop a long wait. Keep wait_seconds below your own configured cap."
+                ),
             ),
         ] = 0,
     ) -> JobStatusResult:

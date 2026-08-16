@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, AsyncIterator, List
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +33,7 @@ from mcp_agy.core.backend_manager import (
 )
 from mcp_agy.core.cli_backend import (
     SubprocessCLIBackend,
+    _detect_changed_files,
     find_agy_executable,
 )
 from mcp_agy.core.mock_backend import MockAGYBackend
@@ -1161,3 +1164,67 @@ class TestServerBackendIntegration:
         chat_data = json.loads(chat_res[0][0].text)
         assert chat_data["status"] == "success"
         assert len(chat_data["response"]) > 0
+
+
+class TestChangedFileDetection:
+    """Guards the telemetry that tells the architect what a run actually touched.
+
+    The bug this class exists for: a timed-out run reported `modified_files: []` while +203
+    lines sat on disk. `modified_files` was built only from stream events naming a tool in
+    `FILE_MODIFICATION_TOOLS` - an allow-list of another program's tool names - so a write that
+    arrived any other way was invisible. Reporting zero is worse than reporting nothing: the
+    caller believes the workspace is clean and moves on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_detects_a_write_no_stream_event_ever_mentioned(self, git_workspace):
+        """The motivating case: a file appears, no tool event announced it, telemetry still sees it."""
+        started = time.time()
+        await asyncio.sleep(0.01)
+        git_workspace.write_file("src/written_by_unknown_tool.py", "x = 1\n")
+
+        found = await _detect_changed_files(git_workspace.str_path, started)
+
+        assert "src/written_by_unknown_tool.py" in found, (
+            "A file written during the run must be reported even when no recognised tool "
+            "event named it - that gap is the whole reason this detector exists"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignores_edits_that_predate_the_run(self, git_workspace):
+        """A workspace mid-edit is normal; claiming its pre-existing changes would be its own lie."""
+        git_workspace.write_file("src/app.py", "def run():\n    return 'edited before the job began'\n")
+        old = os.path.getmtime(os.path.join(git_workspace.str_path, "src/app.py"))
+
+        # The run starts well after that edit landed.
+        found = await _detect_changed_files(git_workspace.str_path, old + 60.0)
+
+        assert "src/app.py" not in found, (
+            "Dirt that was already there when the run started is not this run's doing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_a_deletion(self, git_workspace):
+        """A removed file cannot be stat'd, and a deletion is still a change worth reporting."""
+        started = time.time()
+        await asyncio.sleep(0.01)
+        os.remove(os.path.join(git_workspace.str_path, "src/app.py"))
+
+        found = await _detect_changed_files(git_workspace.str_path, started)
+
+        assert "src/app.py" in found
+
+    @pytest.mark.asyncio
+    async def test_non_git_workspace_degrades_quietly(self, non_git_workspace):
+        """No repo means no ground truth - report nothing rather than fail the run over it."""
+        non_git_workspace.write_file("note.txt", "hello\n")
+
+        found = await _detect_changed_files(non_git_workspace.str_path, 0.0)
+
+        assert found == set()
+
+    @pytest.mark.asyncio
+    async def test_missing_path_returns_empty_instead_of_raising(self):
+        """Telemetry must never be the thing that turns a finished run into a failed one."""
+        assert await _detect_changed_files("", 0.0) == set()
+        assert await _detect_changed_files("Z:/khong/ton/tai/dau", 0.0) == set()

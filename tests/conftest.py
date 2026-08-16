@@ -1006,3 +1006,28 @@ def no_framework_workspace(ephemeral_workspace: EphemeralWorkspace) -> Ephemeral
     ws.write_file("notes.txt", "Architecture meeting notes.\n")
     ws.write_file("data.csv", "id,name,role\n1,Alice,architect\n2,Bob,worker\n")
     return ws
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_job_markers() -> Generator[Path, None, None]:
+    """Send job completion markers to a throwaway directory for the whole run.
+
+    Without this they land in `<tempdir>/mcp_agy_jobs`, the same directory the real server uses
+    on this machine. `JobManager.reset()` deletes the ones it still owns, but a job that
+    finishes *after* a reset writes its marker anyway, so a full suite left 317 files behind -
+    down from ~700, still growing by a few hundred every run, in a directory nobody owns.
+
+    Scoped to the session and autouse so no test has to remember: the override is read inside
+    `_marker_dir()` on every job, so it must be in place before the first one starts.
+    """
+    holding = Path(tempfile.mkdtemp(prefix="mcp_agy_markers_"))
+    previous = os.environ.get("MCP_AGY_JOB_MARKER_DIR")
+    os.environ["MCP_AGY_JOB_MARKER_DIR"] = str(holding)
+    try:
+        yield holding
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_AGY_JOB_MARKER_DIR", None)
+        else:
+            os.environ["MCP_AGY_JOB_MARKER_DIR"] = previous
+        shutil.rmtree(holding, ignore_errors=True)
