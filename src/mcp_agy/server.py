@@ -223,7 +223,9 @@ def create_mcp_server(
         if effort.strip():
             extra["effort"] = effort.strip()
 
-        async with lock_mgr.lock(validated_ws):
+        # `plan` cannot write, so it takes a reader lock: two investigations of one repo run
+        # together instead of queueing. `accept-edits` stays exclusive.
+        async with lock_mgr.lock(validated_ws, shared=(mode == "plan")):
             if backend_executor is not None:
                 return await backend_executor(
                     workspace_path=normalized_workspace,
@@ -411,7 +413,9 @@ def create_mcp_server(
         normalized_workspace = str(validated_ws)
         lock_mgr = get_workspace_lock_manager()
 
-        async with lock_mgr.lock(validated_ws):
+        # Reading a diff cannot change the tree, so it shares: inspecting one repo while an
+        # investigation runs against it is exactly the pairing an architect wants.
+        async with lock_mgr.lock(validated_ws, shared=True):
             if diff_executor is not None:
                 return await diff_executor(workspace_path=normalized_workspace)
 
@@ -633,7 +637,11 @@ def create_mcp_server(
             # The lock is taken inside the job, not by the call that started it: two jobs against
             # the same workspace must still serialize, but the architect must not be made to wait
             # for that here - waiting is the thing this tool exists to avoid.
-            async with lock_mgr.lock(validated_ws):
+            #
+            # `plan` takes the reader lock, so several background investigations of one repo
+            # actually run at once. Under the old mutex they reported `running_count: 3` while
+            # only one `agy.EXE` existed - the queueing was invisible from the outside.
+            async with lock_mgr.lock(validated_ws, shared=(mode == "plan")):
                 if backend_executor is not None:
                     return await backend_executor(
                         workspace_path=normalized_workspace,

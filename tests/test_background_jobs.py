@@ -22,6 +22,7 @@ import pytest
 from mcp_agy.core.jobs import JobManager, reset_job_manager
 from mcp_agy.core.models import TaskExecutionResult, TokenUsage
 from mcp_agy.server import create_mcp_server
+from mcp_agy.utils.workspace import WorkspaceLockManager, WorkspaceLockTimeoutError
 
 
 @pytest.fixture(autouse=True)
@@ -514,3 +515,129 @@ class TestJobManagerHousekeeping:
 
         assert manager.get(job.job_id) is None, "The first job should have been pruned"
         assert not marker.exists(), "The pruned job's marker file must be deleted from disk"
+
+
+class TestWorkspaceReadWriteLock:
+    """The per-workspace lock lets reads share and still keeps writes exclusive.
+
+    Before this, every operation on a workspace took the same mutex, so two `mode:"plan"`
+    investigations of one repo queued behind each other while reporting `running_count: 2`.
+    The queueing was invisible from outside, which is the worst kind: the architecture promises
+    "delegate and keep working" and quietly did not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_readers_hold_the_same_workspace_at_once(self, git_workspace):
+        mgr = WorkspaceLockManager()
+        both_inside = asyncio.Event()
+        first_may_leave = asyncio.Event()
+
+        async def reader(is_first: bool) -> None:
+            async with mgr.lock(git_workspace.str_path, shared=True):
+                if is_first:
+                    await asyncio.wait_for(both_inside.wait(), timeout=5)
+                else:
+                    both_inside.set()
+                    await asyncio.wait_for(first_may_leave.wait(), timeout=5)
+
+        first = asyncio.create_task(reader(True))
+        second = asyncio.create_task(reader(False))
+        await asyncio.wait_for(both_inside.wait(), timeout=5)
+        first_may_leave.set()
+        await asyncio.gather(first, second)
+
+    @pytest.mark.asyncio
+    async def test_a_writer_still_excludes_a_reader(self, git_workspace):
+        mgr = WorkspaceLockManager()
+        writer_inside = asyncio.Event()
+        reader_got_in = False
+
+        async def writer() -> None:
+            async with mgr.lock(git_workspace.str_path):
+                writer_inside.set()
+                await asyncio.sleep(0.25)
+
+        async def reader() -> None:
+            nonlocal reader_got_in
+            await asyncio.wait_for(writer_inside.wait(), timeout=5)
+            async with mgr.lock(git_workspace.str_path, shared=True):
+                reader_got_in = True
+
+        w = asyncio.create_task(writer())
+        r = asyncio.create_task(reader())
+        await asyncio.sleep(0.05)
+        assert not reader_got_in, "a reader must not enter while a writer holds the workspace"
+        await asyncio.gather(w, r)
+        assert reader_got_in, "the reader must get in once the writer leaves"
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_writer_is_not_starved_by_arriving_readers(self, git_workspace):
+        """The failure mode of a naive reader-preferring lock, and worse here than contention.
+
+        A steady trickle of investigations must not hold an edit off forever, so a reader that
+        arrives while a writer waits queues behind it instead of joining the batch in progress.
+        """
+        mgr = WorkspaceLockManager()
+        order: list[str] = []
+        first_reader_in = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def first_reader() -> None:
+            async with mgr.lock(git_workspace.str_path, shared=True):
+                first_reader_in.set()
+                await asyncio.wait_for(release_first.wait(), timeout=5)
+                order.append("reader-1")
+
+        async def waiting_writer() -> None:
+            await asyncio.wait_for(first_reader_in.wait(), timeout=5)
+            await asyncio.sleep(0.05)
+            async with mgr.lock(git_workspace.str_path):
+                order.append("writer")
+
+        async def late_reader() -> None:
+            await asyncio.wait_for(first_reader_in.wait(), timeout=5)
+            await asyncio.sleep(0.15)  # arrives after the writer is already queued
+            async with mgr.lock(git_workspace.str_path, shared=True):
+                order.append("reader-2")
+
+        tasks = [
+            asyncio.create_task(first_reader()),
+            asyncio.create_task(waiting_writer()),
+            asyncio.create_task(late_reader()),
+        ]
+        await asyncio.sleep(0.3)
+        release_first.set()
+        await asyncio.gather(*tasks)
+
+        assert order.index("writer") < order.index("reader-2"), (
+            f"a reader arriving after the writer queued jumped ahead of it: {order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_writer_does_not_block_later_readers(self, git_workspace):
+        """The cancellation path: a writer that gives up must stop being counted as waiting.
+
+        `_writers_waiting` is decremented in a `finally` precisely so this holds - leave it out
+        and one timeout wedges every future reader on that workspace for the process lifetime.
+        """
+        mgr = WorkspaceLockManager()
+        holder_in = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def holder() -> None:
+            async with mgr.lock(git_workspace.str_path):
+                holder_in.set()
+                await asyncio.wait_for(release_holder.wait(), timeout=5)
+
+        h = asyncio.create_task(holder())
+        await asyncio.wait_for(holder_in.wait(), timeout=5)
+
+        with pytest.raises(WorkspaceLockTimeoutError):
+            async with mgr.lock(git_workspace.str_path, timeout=0.1):
+                pass
+
+        release_holder.set()
+        await h
+
+        async with mgr.lock(git_workspace.str_path, shared=True, timeout=2):
+            pass

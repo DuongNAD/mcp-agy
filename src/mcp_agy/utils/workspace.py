@@ -256,11 +256,69 @@ def validate_workspace_path(
     return canonical
 
 
+class _WorkspaceRwLock:
+    """One workspace's lock: many readers, or one writer, never both.
+
+    Why not `asyncio.Lock`: it serialises *everything* on a workspace, which is correct for
+    edits and needlessly strict for reads. Two `mode:"plan"` investigations of the same repo
+    cannot interfere - they open files and nothing else - yet under a plain mutex the second
+    waits for the first. Measured: three plan jobs dispatched at once reported
+    `running_count: 3` while exactly one `agy.exe` existed. The architecture promises "delegate
+    and keep working"; a lock that queues reads quietly takes that back.
+
+    Writers are never starved. A reader arriving while a writer waits queues behind it rather
+    than joining the current read batch - otherwise a steady trickle of investigations could
+    hold off an edit indefinitely, which is the classic failure of a naive reader-preferring
+    lock and is worse here than the contention it avoids.
+    """
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    def locked(self) -> bool:
+        """True while anyone holds this workspace, reader or writer."""
+        return self._writer or self._readers > 0
+
+    @property
+    def reader_count(self) -> int:
+        return self._readers
+
+    async def acquire_read(self) -> None:
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._writer and self._writers_waiting == 0)
+            self._readers += 1
+
+    async def release_read(self) -> None:
+        async with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    async def acquire_write(self) -> None:
+        async with self._cond:
+            self._writers_waiting += 1
+            try:
+                await self._cond.wait_for(lambda: not self._writer and self._readers == 0)
+            finally:
+                # Runs on the cancellation path too - a timed-out writer that stayed counted
+                # would block every future reader on this workspace, forever.
+                self._writers_waiting -= 1
+            self._writer = True
+
+    async def release_write(self) -> None:
+        async with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
 class WorkspaceLockManager:
     """Manages per-workspace asynchronous mutex locks to serialize concurrent operations."""
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, _WorkspaceRwLock] = {}
         self._lock_ref_counts: dict[str, int] = {}
         self._internal_lock = asyncio.Lock()
 
@@ -287,12 +345,17 @@ class WorkspaceLockManager:
         self,
         workspace_path: str | Path,
         timeout: Optional[float] = None,
+        shared: bool = False,
     ) -> AsyncIterator[Path]:
         """Acquire an async concurrency lock for a workspace path.
 
         Args:
             workspace_path: Target workspace path to lock.
             timeout: Optional maximum wait time in seconds before raising WorkspaceLockTimeoutError.
+            shared: Take a reader lock instead of an exclusive one. Only for operations that
+                cannot modify the workspace - reading a diff, a `mode:"plan"` investigation.
+                Several readers proceed together; a writer still excludes them all. Defaults to
+                exclusive, so an operation is serialised unless someone has thought about it.
 
         Yields:
             Path: Canonical Path of the locked workspace.
@@ -305,30 +368,35 @@ class WorkspaceLockManager:
 
         async with self._internal_lock:
             if key not in self._locks:
-                self._locks[key] = asyncio.Lock()
+                self._locks[key] = _WorkspaceRwLock()
                 self._lock_ref_counts[key] = 0
             self._lock_ref_counts[key] += 1
             ws_lock = self._locks[key]
+
+        acquire = ws_lock.acquire_read if shared else ws_lock.acquire_write
+        release = ws_lock.release_read if shared else ws_lock.release_write
+        kind = "shared" if shared else "exclusive"
 
         acquired = False
         try:
             if timeout is not None and timeout > 0:
                 try:
-                    await asyncio.wait_for(ws_lock.acquire(), timeout=timeout)
+                    await asyncio.wait_for(acquire(), timeout=timeout)
                     acquired = True
                 except asyncio.TimeoutError as exc:
                     raise WorkspaceLockTimeoutError(
-                        f"Timed out after {timeout}s waiting for workspace lock on '{canonical}'."
+                        f"Timed out after {timeout}s waiting for {kind} workspace lock "
+                        f"on '{canonical}'."
                     ) from exc
             else:
-                await ws_lock.acquire()
+                await acquire()
                 acquired = True
 
             yield canonical
 
         finally:
             if acquired:
-                ws_lock.release()
+                await release()
 
             async with self._internal_lock:
                 if key in self._lock_ref_counts:
