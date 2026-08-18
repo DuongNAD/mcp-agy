@@ -161,8 +161,12 @@ agy_run_tests(workspace)                   -> verify it
 ```
 
 `agy_job_status` with `wait_seconds` returns the instant the job finishes, so a short job needs
-no polling loop and a long one costs one cheap call per check. Jobs live in the server process:
-if it restarts, `agy_job_status` answers `not_found` and the run must be re-issued.
+no polling loop and a long one costs one cheap call per check. The recommended waiting pattern is
+monitoring `done_marker_path` on disk (e.g. `until [ -f <path> ]; do sleep 5; done`) and calling
+`agy_job_status(job_id, wait_seconds=0)`. `wait_seconds` should always be kept strictly below your
+client's per-call timeout: a call with `wait_seconds=300` cut by a 60s client timeout will tear down
+and restart the server process. Completed job results are atomically persisted to disk before `.done`
+markers appear, so finished jobs survive server restarts and return with `recovered_from_disk=True`.
 
 | Tool Name | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|---|

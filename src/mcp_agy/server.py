@@ -527,6 +527,7 @@ def create_mcp_server(
                 else None
             ),
             error_details=job.error_details,
+            recovered_from_disk=job.recovered_from_disk,
         )
 
     @server.tool(
@@ -681,18 +682,23 @@ def create_mcp_server(
         description=(
             "Checks a background AGY job and returns its full result once it has finished.\n\n"
             "Architect Guidance:\n"
+            "- Recommended waiting method: Monitor `done_marker_path` on disk (e.g. `until [ -f <path> ]; do sleep 5; done`), "
+            "then call `agy_job_status(job_id, wait_seconds=0)` once to collect the result.\n"
             "- Pass `wait_seconds` to block until the job finishes instead of polling: the call returns "
             "the moment the job is done, or at the deadline with status still 'running'. Keep `wait_seconds` "
-            "below whatever per-call cap your client enforces (the shipped Claude Code config raises this "
-            "to 30 minutes, but a client left at its 60-second default will drop a long wait).\n"
+            "strictly below whatever per-call cap your client enforces (e.g. 60s default on Claude Code, although shipped "
+            "configs may raise it to 30 minutes). Measured incident: a call with `wait_seconds=300` was cut by the client "
+            "timeout, triggering a server process restart. Before result persistence was added, that restart completely "
+            "wiped out a completed 255s / 864k-token job result.\n"
             "- `status: 'completed'` means the job ran to completion; read `result.status` for whether "
             "AGY itself succeeded, and `result.modified_files` for what it changed.\n"
-            "- 'not_found' means the id is unknown to this server - typically because it restarted.\n\n"
+            "- If the server process restarted after the job completed, `recovered_from_disk` will be True.\n"
+            "- 'not_found' means the id is unknown to this server process and no unexpired result exists on disk.\n\n"
             "Args:\n"
             "    job_id: Identifier returned by agy_start_task.\n"
             "    wait_seconds: Seconds to wait for completion before returning (default: 0, max: 600).\n\n"
             "Returns:\n"
-            "    JobStatusResult containing status, is_done, duration_seconds, result, and error_details."
+            "    JobStatusResult containing status, is_done, duration_seconds, result, recovered_from_disk, and error_details."
         ),
     )
     async def agy_job_status(
@@ -723,8 +729,8 @@ def create_mcp_server(
                 status="not_found",
                 job_id=job_id,
                 error_details=(
-                    "No job with that id in this server process. Jobs do not survive a server "
-                    "restart; re-issue the run with agy_start_task."
+                    "No job with that id in this server process or on disk. If the server restarted, "
+                    "the job may have expired past TTL or never finished; re-issue the run with agy_start_task."
                 ),
             )
         return _describe_job(job)
