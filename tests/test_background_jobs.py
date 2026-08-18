@@ -15,19 +15,23 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import time
 from typing import Any, Dict
 
 import pytest
 
-from mcp_agy.core.jobs import JobManager, reset_job_manager
+from mcp_agy.core.jobs import JobManager, get_job_manager, reset_job_manager
 from mcp_agy.core.models import TaskExecutionResult, TokenUsage
 from mcp_agy.server import create_mcp_server
 from mcp_agy.utils.workspace import WorkspaceLockManager, WorkspaceLockTimeoutError
 
 
 @pytest.fixture(autouse=True)
-def _clean_job_registry():
+def _clean_job_registry(tmp_path, monkeypatch):
     """Each test gets an empty registry: job ids and listings must not leak between tests."""
+    marker_d = tmp_path / "mcp_agy_jobs"
+    marker_d.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("MCP_AGY_JOB_MARKER_DIR", str(marker_d))
     reset_job_manager()
     yield
     reset_job_manager()
@@ -641,3 +645,248 @@ class TestWorkspaceReadWriteLock:
 
         async with mgr.lock(git_workspace.str_path, shared=True, timeout=2):
             pass
+
+
+@pytest.mark.anyio
+class TestJobPersistenceAcrossRestart:
+    """Tests for job result persistence and recovery across server restarts (A1 & A2)."""
+
+    async def test_completed_job_writes_result_json(self, client_factory, git_workspace):
+        """1. Completed job writes <job_id>.result.json and result is not None."""
+        executor = _ControllableExecutor()
+        server = create_mcp_server(backend_executor=executor)
+
+        async with client_factory(server) as session:
+            handle = _payload(
+                await session.call_tool(
+                    "agy_start_task",
+                    {"workspace_path": str(git_workspace), "prompt": "Save result test"},
+                )
+            )
+            job_id = handle["job_id"]
+            marker_dir = Path(handle["done_marker_path"]).parent
+            result_file = marker_dir / f"{job_id}.result.json"
+
+            assert not result_file.exists(), "Result file must not exist before job finishes"
+
+            executor.release.set()
+            done = _payload(
+                await session.call_tool(
+                    "agy_job_status", {"job_id": job_id, "wait_seconds": 5}
+                )
+            )
+            assert done["status"] == "completed"
+            assert result_file.is_file(), "Result JSON file must exist on disk"
+
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+            assert data["job_id"] == job_id
+            assert data["status"] == "completed"
+            assert data["result"] is not None
+            assert data["result"]["status"] == "success"
+            assert data["result"]["modified_files"] == ["src/composables/useGateway.ts"]
+
+    async def test_write_order_result_json_before_done_marker(self, monkeypatch):
+        """2. At the exact instant .done is written, .result.json already exists and parses cleanly."""
+        manager = JobManager()
+
+        async def _quick_run() -> TaskExecutionResult:
+            return TaskExecutionResult(
+                status="success",
+                response="All done",
+                modified_files=["file.py"],
+            )
+
+        orig_write_text = Path.write_text
+        done_marker_checked = False
+
+        def _checked_write_text(path_obj: Path, data: str, *args: Any, **kwargs: Any) -> int:
+            nonlocal done_marker_checked
+            if str(path_obj).endswith(".done"):
+                # At the exact instant .done is being written, .result.json MUST already exist on disk!
+                res_path = path_obj.parent / f"{path_obj.stem}.result.json"
+                assert res_path.is_file(), f"Result file {res_path} must exist BEFORE .done is written"
+                parsed = json.loads(res_path.read_text(encoding="utf-8"))
+                assert parsed["job_id"] == path_obj.stem
+                assert parsed["status"] == "completed"
+                done_marker_checked = True
+            return orig_write_text(path_obj, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _checked_write_text)
+
+        job = manager.start(_quick_run, kind="task", workspace_path="E:/ws", prompt="Order test")
+        assert job.task is not None
+        await job.task
+
+        assert done_marker_checked, "Hook must have verified result file existence when .done was written"
+
+    async def test_restart_simulation_recovers_job_from_disk(self, client_factory, git_workspace):
+        """3. Restart simulation: reset_job_manager() -> get(job_id) and agy_job_status recover from disk."""
+        executor = _ControllableExecutor()
+        server = create_mcp_server(backend_executor=executor)
+
+        async with client_factory(server) as session:
+            handle = _payload(
+                await session.call_tool(
+                    "agy_start_task",
+                    {"workspace_path": str(git_workspace), "prompt": "Restart test"},
+                )
+            )
+            job_id = handle["job_id"]
+            executor.release.set()
+
+            # Ensure it finishes
+            await session.call_tool(
+                "agy_job_status", {"job_id": job_id, "wait_seconds": 5}
+            )
+
+        # Simulate server restart by wiping out the JobManager instance
+        reset_job_manager()
+
+        # Check via JobManager.get() directly
+        mgr = get_job_manager()
+        assert job_id not in mgr._jobs, "In-memory registry must be empty after reset"
+        recovered_job = mgr.get(job_id)
+        assert recovered_job is not None, "Job should be recovered from disk"
+        assert recovered_job.job_id == job_id
+        assert recovered_job.recovered_from_disk is True
+        assert recovered_job.task is None
+        assert recovered_job.is_done is True
+        assert recovered_job.status == "completed"
+        assert isinstance(recovered_job.result, TaskExecutionResult)
+        assert recovered_job.result.response == "Refactored the gateway teardown path."
+
+        # Also verify via MCP server tool call
+        new_server = create_mcp_server(backend_executor=executor)
+        async with client_factory(new_server) as session:
+            status = _payload(
+                await session.call_tool("agy_job_status", {"job_id": job_id})
+            )
+            assert status["status"] == "completed"
+            assert status["recovered_from_disk"] is True
+            assert status["result"] is not None
+            assert status["result"]["status"] == "success"
+            assert status["result"]["modified_files"] == ["src/composables/useGateway.ts"]
+
+    async def test_failed_job_writes_result_json_with_error(self):
+        """4. Failed job writes .result.json with status='failed' and error_details."""
+        manager = JobManager()
+
+        async def _explode() -> TaskExecutionResult:
+            raise ValueError("Something went terribly wrong")
+
+        job = manager.start(_explode, kind="task", workspace_path="E:/ws", prompt="Fail test")
+        assert job.task is not None
+        try:
+            await job.task
+        except Exception:
+            pass
+
+        result_file = Path(job.done_marker_path).parent / f"{job.job_id}.result.json"
+        assert result_file.is_file(), "Result file must be written for failed job"
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["status"] == "failed"
+        assert "ValueError: Something went terribly wrong" in (data["error_details"] or "")
+
+    async def test_serialization_failure_does_not_fail_job(self):
+        """5. Write/serialization failure logs warning and does not crash or fail the job."""
+        manager = JobManager()
+
+        class UnserializableObject:
+            pass
+
+        async def _run_with_weird_result() -> Any:
+            # Return an object that cannot be serialized by json.dumps
+            return UnserializableObject()
+
+        job = manager.start(_run_with_weird_result, kind="task", workspace_path="E:/ws", prompt="Unserializable")
+        assert job.task is not None
+        await job.task
+
+        assert job.status == "completed", "Job must still be completed in memory"
+        result_file = Path(job.done_marker_path).parent / f"{job.job_id}.result.json"
+        assert result_file.is_file()
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["result"] is None
+        assert "serialization_error" in data
+        assert "TypeError" in data["serialization_error"]
+
+    async def test_prune_and_reset_cleans_both_done_and_result_files(self):
+        """6. After _prune() and reset(), both .done and .result.json are removed from disk."""
+        manager = JobManager()
+
+        async def _instant() -> TaskExecutionResult:
+            return TaskExecutionResult(status="success", response="ok")
+
+        job = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="Clean test")
+        assert job.task is not None
+        await job.task
+
+        done_file = Path(job.done_marker_path)
+        result_file = done_file.parent / f"{job.job_id}.result.json"
+        assert done_file.is_file()
+        assert result_file.is_file()
+
+        # Reset cleans up
+        manager.reset()
+        assert not done_file.exists(), ".done file must be deleted on reset()"
+        assert not result_file.exists(), ".result.json file must be deleted on reset()"
+
+    async def test_expired_on_disk_job_is_pruned_and_not_recovered(self):
+        """7. Job older than TTL is pruned from disk and returns None on get()."""
+        manager = JobManager()
+
+        async def _instant() -> TaskExecutionResult:
+            return TaskExecutionResult(status="success", response="ok")
+
+        job = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="TTL test")
+        assert job.task is not None
+        await job.task
+
+        done_file = Path(job.done_marker_path)
+        result_file = done_file.parent / f"{job.job_id}.result.json"
+        assert result_file.is_file()
+
+        # Modify the on-disk file to have finished_at 2 hours in the past (> 3600s TTL)
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        data["finished_at"] = time.time() - 7200.0
+        result_file.write_text(json.dumps(data), encoding="utf-8")
+
+        # Clear in-memory
+        reset_job_manager()
+        mgr = get_job_manager()
+
+        # get() should detect expiry, delete the files, and return None
+        res = mgr.get(job.job_id)
+        assert res is None, "Expired job must not be recovered from disk"
+        assert not result_file.exists(), "Expired result file must be deleted"
+        assert not done_file.exists(), "Expired done marker must be deleted"
+
+    async def test_list_jobs_recovers_on_disk_jobs_without_duplicates(self):
+        """8. After reset_job_manager(), list_jobs() discovers unexpired on-disk jobs sorted newest first."""
+        manager = JobManager()
+
+        async def _instant() -> TaskExecutionResult:
+            return TaskExecutionResult(status="success", response="ok")
+
+        job1 = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="Job 1")
+        assert job1.task is not None
+        await job1.task
+
+        await asyncio.sleep(0.02)
+
+        job2 = manager.start(_instant, kind="task", workspace_path="E:/ws", prompt="Job 2")
+        assert job2.task is not None
+        await job2.task
+
+        # Simulate restart
+        reset_job_manager()
+        mgr = get_job_manager()
+
+        listed = mgr.list_jobs()
+        listed_ids = [j.job_id for j in listed]
+
+        assert len(listed) == 2
+        assert listed_ids == [job2.job_id, job1.job_id], "Newest job must come first"
+        assert all(j.recovered_from_disk for j in listed)
+        assert listed[0].prompt_preview.startswith("Job 2")
+
