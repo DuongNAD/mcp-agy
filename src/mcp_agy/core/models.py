@@ -277,6 +277,10 @@ class JobStatusResult(BaseModel):
         default=None,
         description="Why the job failed or was cancelled, if it did not complete",
     )
+    recovered_from_disk: bool = Field(
+        default=False,
+        description="True if this job record was reconstructed from disk after a server restart",
+    )
 
 
 class JobListResult(BaseModel):

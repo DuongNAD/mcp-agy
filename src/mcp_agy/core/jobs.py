@@ -17,6 +17,8 @@ for the architect to notice and re-issue rather than wait forever on an id that 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -40,7 +42,7 @@ CANCELLED = "cancelled"
 
 
 def _marker_dir() -> Path:
-    """Where completion markers land. `MCP_AGY_JOB_MARKER_DIR` redirects it.
+    """Where completion markers and result records land. `MCP_AGY_JOB_MARKER_DIR` redirects it.
 
     The override exists because `reset()` cannot catch every marker: a job that finishes *after*
     the registry is cleared still writes one, and the test suite resets between cases. Cleaning
@@ -57,6 +59,104 @@ def _marker_dir() -> Path:
     return d
 
 
+def _serialize_job_result(result: Any) -> tuple[Any, Optional[str]]:
+    """Serialize JobRecord.result to a JSON-safe structure.
+
+    Returns (serialized_data, serialization_error_or_none).
+    """
+    if result is None:
+        return None, None
+
+    try:
+        # Pydantic v2 model
+        if hasattr(result, "model_dump") and callable(result.model_dump):
+            dumped = result.model_dump(mode="json")
+            json.dumps(dumped)
+            return dumped, None
+
+        # Pydantic v1 model
+        if hasattr(result, "dict") and callable(result.dict):
+            dumped = result.dict()
+            json.dumps(dumped)
+            return dumped, None
+
+        # Dataclass
+        if dataclasses.is_dataclass(result) and not isinstance(result, type):
+            dumped = dataclasses.asdict(result)
+            json.dumps(dumped)
+            return dumped, None
+
+        # Dict / list / primitive
+        json.dumps(result)
+        return result, None
+    except Exception as exc:
+        logger.warning(f"Failed to serialize job result: {exc}")
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _load_job_from_disk(result_file: Path) -> Optional[JobRecord]:
+    """Reconstruct a JobRecord from its on-disk result file.
+
+    Returns None if the file is invalid, corrupted, or has expired past TTL.
+    """
+    try:
+        if not result_file.is_file():
+            return None
+        text = result_file.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return None
+
+        job_id = data.get("job_id")
+        if not job_id:
+            return None
+
+        finished_at = data.get("finished_at")
+        started_at = data.get("started_at", 0.0)
+        reference_time = finished_at if finished_at is not None else started_at
+
+        # An on-disk record older than TTL must not be revived into the registry; deleting the
+        # expired files prevents unpruned runs from piling up indefinitely.
+        if (time.time() - reference_time) > COMPLETED_JOB_TTL_SECONDS:
+            try:
+                result_file.unlink(missing_ok=True)
+                (_marker_dir() / f"{job_id}.done").unlink(missing_ok=True)
+                (_marker_dir() / f"{job_id}.result.json.tmp").unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+
+        raw_result = data.get("result")
+        result_obj = raw_result
+        if isinstance(raw_result, dict):
+            try:
+                from mcp_agy.core.models import TaskExecutionResult
+                result_obj = TaskExecutionResult.model_validate(raw_result)
+            except Exception:
+                result_obj = raw_result
+
+        done_marker_path = str(_marker_dir() / f"{job_id}.done")
+        job = JobRecord(
+            job_id=job_id,
+            kind=data.get("kind", "task"),
+            workspace_path=data.get("workspace_path", ""),
+            prompt=data.get("prompt_preview", ""),
+            done_marker_path=done_marker_path,
+            recovered_from_disk=True,
+        )
+        job.prompt_preview = data.get("prompt_preview", job.prompt_preview)
+        job.status = data.get("status", COMPLETED)
+        job.started_at = started_at
+        job.finished_at = finished_at
+        job.result = result_obj
+        job.error_details = data.get("error_details")
+        job.task = None
+        return job
+    except Exception as exc:
+        logger.warning(f"Failed to load job from disk file {result_file}: {exc}")
+        return None
+
+
 class JobRecord:
     """One AGY run and everything known about it, before and after it finishes."""
 
@@ -67,6 +167,7 @@ class JobRecord:
         workspace_path: str,
         prompt: str,
         done_marker_path: str = "",
+        recovered_from_disk: bool = False,
     ) -> None:
         self.job_id = job_id
         self.kind = kind
@@ -81,6 +182,7 @@ class JobRecord:
         self.error_details: Optional[str] = None
         self.task: Optional[asyncio.Task[Any]] = None
         self.done_marker_path = done_marker_path
+        self.recovered_from_disk = recovered_from_disk
 
     @property
     def is_done(self) -> bool:
@@ -136,6 +238,43 @@ class JobManager:
             finally:
                 if job.finished_at is None:
                     job.finished_at = time.time()
+
+                # Write .result.json BEFORE .done marker:
+                # The documented contract for clients watching `done_marker_path` requires that
+                # the moment `.done` appears on disk, the full result is already committed and
+                # readable. Writing `.result.json` first ensures no reader ever encounters a
+                # missing or partially written result payload.
+                try:
+                    serialized_result, ser_err = _serialize_job_result(job.result)
+                    record_data: Dict[str, Any] = {
+                        "job_id": job.job_id,
+                        "kind": job.kind,
+                        "workspace_path": job.workspace_path,
+                        "prompt_preview": job.prompt_preview,
+                        "status": job.status,
+                        "started_at": job.started_at,
+                        "finished_at": job.finished_at,
+                        "duration_seconds": job.duration_seconds,
+                        "error_details": job.error_details,
+                        "result": serialized_result,
+                    }
+                    if ser_err is not None:
+                        record_data["serialization_error"] = ser_err
+
+                    result_path = _marker_dir() / f"{job.job_id}.result.json"
+                    tmp_path = _marker_dir() / f"{job.job_id}.result.json.tmp"
+
+                    tmp_path.write_text(
+                        json.dumps(record_data, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    os.replace(str(tmp_path), str(result_path))
+                except Exception as exc:
+                    # Disk persistence failures must never turn an otherwise completed run into a failure.
+                    logger.warning(
+                        f"Failed to write result file for job {job.job_id}: {exc}"
+                    )
+
                 if job.done_marker_path:
                     try:
                         p = Path(job.done_marker_path)
@@ -153,11 +292,40 @@ class JobManager:
         return job
 
     def get(self, job_id: str) -> Optional[JobRecord]:
-        return self._jobs.get(job_id)
+        job = self._jobs.get(job_id)
+        if job is not None:
+            return job
+
+        # Fall back to on-disk result: when a client times out and restarts the server process,
+        # recovering the completed result from disk prevents throwing away hundreds of seconds
+        # and hundreds of thousands of tokens of completed work.
+        result_path = _marker_dir() / f"{job_id}.result.json"
+        if result_path.is_file():
+            recovered = _load_job_from_disk(result_path)
+            if recovered is not None:
+                self._jobs[job_id] = recovered
+                return recovered
+        return None
 
     def list_jobs(self) -> List[JobRecord]:
-        """Newest first, so a listing opens on what the architect most likely wants."""
-        return sorted(self._jobs.values(), key=lambda j: j.started_at, reverse=True)
+        """Newest first, so a listing opens on what the architect most likely wants.
+
+        Merges in-memory jobs with unexpired on-disk records. In-memory records take precedence.
+        """
+        all_jobs: Dict[str, JobRecord] = dict(self._jobs)
+        try:
+            marker_d = _marker_dir()
+            if marker_d.is_dir():
+                for p in marker_d.glob("*.result.json"):
+                    job_id = p.name[:-12]
+                    if job_id not in all_jobs:
+                        recovered = _load_job_from_disk(p)
+                        if recovered is not None:
+                            all_jobs[recovered.job_id] = recovered
+        except Exception as exc:
+            logger.warning(f"Failed to scan on-disk job results: {exc}")
+
+        return sorted(all_jobs.values(), key=lambda j: j.started_at, reverse=True)
 
     async def wait(self, job_id: str, timeout_seconds: float) -> Optional[JobRecord]:
         """Wait up to `timeout_seconds` for a job to finish. Returns as soon as it does.
@@ -204,6 +372,11 @@ class JobManager:
                 Path(job.done_marker_path).unlink(missing_ok=True)
             except Exception:
                 pass
+        try:
+            (_marker_dir() / f"{job.job_id}.result.json").unlink(missing_ok=True)
+            (_marker_dir() / f"{job.job_id}.result.json.tmp").unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _prune(self) -> None:
         """Drop finished jobs that are old or in excess. Running jobs are never dropped."""
@@ -226,11 +399,11 @@ class JobManager:
     def reset(self) -> None:
         """Drop every job without cancelling. For tests.
 
-        Deletes the markers too. `_prune` already does this on the paths it owns, but `reset`
-        is the path the test suite takes between cases, and it used to clear the registry while
-        leaving the files behind: one full run left ~700 markers in a temp directory shared by
-        every run on the machine, and 2 217 had piled up before anyone counted. A cleanup that
-        only fires in production is not cleanup.
+        Deletes both the .done markers and the .result.json files. `_prune` already does
+        this on the paths it owns, but `reset` is the path the test suite takes between cases,
+        and it used to clear the registry while leaving the files behind: one full run left
+        ~700 markers in a temp directory shared by every run on the machine, and 2 217 had
+        piled up before anyone counted. A cleanup that only fires in production is not cleanup.
         """
         for job in list(self._jobs.values()):
             self._delete_marker(job)
