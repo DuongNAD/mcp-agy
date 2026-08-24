@@ -153,12 +153,14 @@ class StdioSubprocessHarness:
         return data
 
     def close(self) -> Tuple[str, str]:
-        """Close stdin, wait for process termination, and return (stdout_remainder, stderr_output)."""
-        if self.proc.stdin and not self.proc.stdin.closed:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
+        """Close stdin, wait for process termination, and return (stdout_remainder, stderr_output).
+
+        `communicate()` closes stdin itself when there is no input to send, so this must not
+        close it first. On Windows the extra close was harmless - that path routes through
+        `Popen._stdin_write`, and closing an already-closed file is a no-op. The POSIX
+        `_communicate` flushes stdin instead, and flushing a closed file raises ValueError, so
+        every subprocess test in this file died in teardown rather than on its assertion.
+        """
         try:
             stdout_rem, _ = self.proc.communicate(timeout=5.0)
         except Exception:

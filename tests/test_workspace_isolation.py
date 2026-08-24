@@ -29,6 +29,7 @@ from mcp_agy import (
     reset_workspace_lock_manager,
     validate_workspace_path,
 )
+from mcp_agy.utils.workspace import CASE_INSENSITIVE_FILESYSTEM
 
 
 @pytest.fixture(autouse=True)
@@ -64,13 +65,17 @@ class TestPathCanonicalization:
         assert canonical == Path.home().resolve()
 
     def test_canonicalize_mixed_slashes(self, tmp_path):
-        """Verifies mixed forward and backward slashes normalize correctly."""
+        """Verifies backslashes separate on Windows and stay literal filename characters elsewhere."""
         sub_dir = tmp_path / "a" / "b"
         sub_dir.mkdir(parents=True)
 
-        mixed_str = f"{tmp_path}/a\\b"
-        canonical = canonicalize_workspace_path(mixed_str)
-        assert canonical == sub_dir.resolve()
+        canonical = canonicalize_workspace_path(f"{tmp_path}/a\\b")
+        if os.name == "nt":
+            assert canonical == sub_dir.resolve()
+        else:
+            # POSIX has exactly one separator, and "a\b" is a legal single filename there.
+            # Rewriting it to "a/b" would silently retarget a workspace that contains one.
+            assert canonical == (tmp_path / "a\\b").resolve()
 
     def test_canonicalize_null_byte_injection_rejected(self):
         """Verifies null byte injection raises WorkspaceSecurityError."""
@@ -91,11 +96,11 @@ class TestPathCanonicalization:
             canonicalize_workspace_path(None)  # type: ignore
 
     def test_get_workspace_key_case_handling(self, tmp_path):
-        """Verifies workspace keys normalize case on Windows."""
+        """Verifies workspace keys fold case wherever the filesystem does."""
         key1 = get_workspace_key(str(tmp_path))
-        key2 = get_workspace_key(str(tmp_path).upper() if os.name == "nt" else str(tmp_path))
-        if os.name == "nt":
-            assert key1 == key2
+        if CASE_INSENSITIVE_FILESYSTEM:
+            # Same directory spelled two ways must be one lock key, or two writers hold it at once.
+            assert get_workspace_key(str(tmp_path).upper()) == key1
             assert key1 == key1.lower()
         else:
             assert isinstance(key1, str)

@@ -23,6 +23,7 @@ from typing import List, Set
 
 from mcp_agy.utils.process import terminate_process_tree, run_subprocess_async, stream_subprocess_lines
 from mcp_agy.utils.workspace import (
+    CASE_INSENSITIVE_FILESYSTEM,
     WorkspaceLockManager,
     WorkspaceLockTimeoutError,
     canonicalize_workspace_path,
@@ -299,7 +300,7 @@ class TestWorkspaceMutexLockStress:
         Verifies:
         - At most 1 task acquires the lock at any time (strict mutual exclusion).
         - All 50 tasks complete successfully without deadlocks.
-        - Case-insensitivity on Windows (keys normalized).
+        - Case-insensitivity wherever the filesystem is (keys normalized).
         - Lock reference counts and active lock cleanup.
         """
         lock_mgr = WorkspaceLockManager()
@@ -312,8 +313,14 @@ class TestWorkspaceMutexLockStress:
 
         async def contender(task_id: int):
             nonlocal current_active_holders, max_concurrent_holders
-            # Alternate upper and lower case on Windows to test case-insensitive mutexing
-            target_path = ws_path.upper() if (task_id % 2 == 0) else ws_path.lower()
+            # Alternate case only where the filesystem ignores it: there both spellings name one
+            # directory and must fold to one lock key. On a case-sensitive filesystem they name
+            # two genuinely different directories, so alternating would prove nothing about the
+            # lock and would fail for the right reason.
+            if CASE_INSENSITIVE_FILESYSTEM:
+                target_path = ws_path.upper() if (task_id % 2 == 0) else ws_path.lower()
+            else:
+                target_path = ws_path
 
             async with lock_mgr.lock(target_path, timeout=10.0):
                 current_active_holders += 1

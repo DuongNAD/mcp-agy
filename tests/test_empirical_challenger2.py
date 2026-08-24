@@ -129,11 +129,9 @@ class EmpiricalSubprocessTester:
         return data
 
     def close(self) -> Tuple[str, str]:
-        if self.proc.stdin and not self.proc.stdin.closed:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
+        # Do not close stdin here: `communicate()` closes it itself, and the POSIX
+        # implementation flushes it first - flushing a closed file raises ValueError. See the
+        # matching note in tests/test_stream_purity_adversarial.py.
         try:
             stdout_rem, _ = self.proc.communicate(timeout=5.0)
         except Exception:

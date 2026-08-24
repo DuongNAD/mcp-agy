@@ -73,6 +73,12 @@ minversion = "8.0"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# Several tests wait on an event a background job sets, with no bound of their own. When a job
+# fails to start at all, that wait never returns and the whole suite hangs with no output - the
+# way it did on macOS, where every workspace was being rejected before any job ran. A per-test
+# cap turns that into one failure naming the hung test, plus the stack it was hung in.
+# The full suite runs in well under a minute, so this only ever fires on a genuine hang.
+timeout = 300
 markers = [
     "tier1: Tier 1 unit tests covering individual MCP tools and models",
     "tier2: Tier 2 boundary and corner case tests",
