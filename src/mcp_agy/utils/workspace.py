@@ -35,6 +35,10 @@ class WorkspaceLockTimeoutError(WorkspaceError, TimeoutError):
     """Raised when acquiring a workspace concurrency lock times out."""
 
 
+# Whether this platform's filesystem treats two spellings that differ only in case as one
+# directory. Consumed by `get_workspace_key`, which explains why it matters.
+CASE_INSENSITIVE_FILESYSTEM: bool = os.name == "nt" or sys.platform == "darwin"
+
 # System-critical roots on Windows
 WIN_SENSITIVE_ROOTS: list[str] = [
     os.environ.get("SystemRoot", "C:\\Windows"),
@@ -64,6 +68,19 @@ POSIX_SENSITIVE_ROOTS: list[str] = [
     "/Applications",
     "/private",
 ]
+
+# Subtrees that sit inside a POSIX_SENSITIVE_ROOTS entry but are not system state.
+#
+# macOS gives every user a private scratch tree under /var/folders (which resolves through the
+# /private symlink), and that is where TMPDIR points - so the blanket "/var" and "/private"
+# rules above reject the most ordinary scratch location on the platform. Measured: every
+# workspace the test suite creates was refused with "Access to system-critical directory ...
+# (inside '/var') is denied", and a caller pointing at a real temp workspace got the same
+# refusal. The subtree is per-user by OS design, so it is carved back out.
+#
+# One entry covers both spellings: Path("/var/folders").resolve() is "/private/var/folders"
+# wherever /var is the usual symlink, and "/var/folders" where it is not.
+POSIX_SCRATCH_EXEMPTIONS: list[str] = ["/var/folders"] if sys.platform == "darwin" else []
 
 
 def canonicalize_workspace_path(path: str | Path) -> Path:
@@ -99,10 +116,20 @@ def canonicalize_workspace_path(path: str | Path) -> Path:
 def get_workspace_key(path: str | Path) -> str:
     """Derive a normalized dictionary key for workspace locking.
 
-    On Windows, keys are lowercased for case-insensitive lookup.
+    On platforms whose filesystem ignores case, two spellings of one directory must fold to one
+    key. The key *is* the workspace's identity here: two keys for one directory means two
+    exclusive locks over the same tree, and two writers each convinced they hold it alone.
+
+    macOS was missing from that list. Its default APFS volume is case-insensitive, so
+    `/Users/x/proj` and `/users/x/proj` are the same directory - and the stress test that locks
+    one workspace under both spellings measured 2 concurrent holders where the invariant is 1.
+
+    A case-sensitive APFS volume folds too, which serializes two genuinely distinct workspaces
+    that differ only in case. That costs throughput in a case nobody sets up on purpose; the
+    other direction costs the isolation guarantee.
     """
     canonical = canonicalize_workspace_path(path)
-    if os.name == "nt":
+    if CASE_INSENSITIVE_FILESYSTEM:
         return str(canonical).lower()
     return str(canonical)
 
@@ -163,7 +190,16 @@ def is_system_critical_path(path: Path) -> tuple[bool, str]:
             except (ValueError, OSError):
                 continue
 
-    # 3. Check POSIX sensitive roots
+    # 3. Carve the per-user scratch subtrees back out before the coarse root rules run
+    for scratch_dir in POSIX_SCRATCH_EXEMPTIONS:
+        try:
+            scratch_path = Path(scratch_dir).resolve()
+            if resolved != scratch_path and resolved.is_relative_to(scratch_path):
+                return False, ""
+        except (ValueError, OSError):
+            continue
+
+    # 4. Check POSIX sensitive roots
     for posix_dir in POSIX_SENSITIVE_ROOTS:
         try:
             posix_path = Path(posix_dir).resolve()
@@ -172,7 +208,7 @@ def is_system_critical_path(path: Path) -> tuple[bool, str]:
         except (ValueError, OSError):
             continue
 
-    # 4. Raw user profile direct root protection
+    # 5. Raw user profile direct root protection
     try:
         user_home = Path.home().resolve()
         if resolved == user_home:
