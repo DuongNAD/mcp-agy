@@ -45,6 +45,7 @@ In contemporary AI-assisted software engineering, single-agent workflows frequen
 2. **Pristine Stdio Protocol Purity**: Standard output (`sys.stdout`) is strictly reserved for JSON-RPC 2.0 frames. All logging, startup banners, and diagnostic traces route exclusively to `sys.stderr`, preventing framing corruption in MCP clients.
 3. **Resilient 3-Tier Backend Fallback**: Seamlessly transitions across Python SDK (`Tier 1`), Subprocess CLI (`Tier 2`), and High-Fidelity Simulation Mock (`Tier 3`) for continuous offline testing and CI workflows.
 4. **Zero-Trust Workspace Isolation**: Path canonicalization, system-critical directory protection, and per-workspace asynchronous mutex concurrency locking prevent race conditions and unintended file modifications.
+5. **Pluggable Worker Reasoning Protocol**: Optional delivery of the [AI Deep Reasoning Toolkit](https://github.com/DuongNAD/ai-deep-reasoning-toolkit) into each workspace, constraining how the worker writes code while leaving the architect's own behaviour untouched. See [§6](#-6-deep-reasoning-toolkit-integration).
 
 ---
 
@@ -175,6 +176,7 @@ markers appear, so finished jobs survive server restarts and return with `recove
 | | `auto_approve` | `bool` | No | `True` | Auto-approve AGY's tool executions and file edits. |
 | | `mode` | `Literal["accept-edits", "plan"]` | No | `"accept-edits"` | `"plan"` is the read-only form — the long-running equivalent of `agy_chat`. |
 | | `timeout_seconds` | `int` | No | `600` | Bounds **the run**, not this call (1 to 3600). |
+| | `rigor` | `Literal["standard", "deep", "off"]` | No | `"standard"` | Reasoning protocol for the run. Inert unless `MCP_AGY_TOOLKIT_PATH` is set — see [§6](#-6-deep-reasoning-toolkit-integration). |
 | **`agy_job_status`** | `job_id` | `str` | **Yes** | — | Id returned by `agy_start_task`. |
 | | `wait_seconds` | `int` | No | `0` | Block up to N seconds, returning early on completion. Capped at 45 so the call always fits inside a client timeout. |
 | **`agy_cancel_job`** | `job_id` | `str` | **Yes** | — | Stops the run and kills its process tree. Not a rollback — files already written stay written. |
@@ -189,6 +191,7 @@ And the 4 synchronous tools:
 | | `auto_approve` | `bool` | No | `True` | Automatically approve tool executions and file edits without interactive confirmation. |
 | | `mode` | `Literal["accept-edits", "plan"]` | No | `"accept-edits"` | `"accept-edits"` for full file modifications; `"plan"` for read-only analysis without disk writes. |
 | | `timeout_seconds` | `int` | No | `600` | Maximum execution duration in seconds (1 to 3600). Enforces process tree termination on timeout. |
+| | `rigor` | `Literal["standard", "deep", "off"]` | No | `"standard"` | Reasoning protocol for the run. Inert unless `MCP_AGY_TOOLKIT_PATH` is set — see [§6](#-6-deep-reasoning-toolkit-integration). |
 | **`agy_chat`** | `prompt` | `str` | **Yes** | — | Analytical query, codebase question, architecture review, or planning consultation. |
 | | `workspace_path` | `str` | No | `""` | Optional workspace directory to provide codebase context for analysis (strictly read-only). |
 | | `conversation_id` | `str` | No | `""` | UUID of a previous conversation session to maintain multi-turn dialogue context. |
@@ -222,9 +225,21 @@ And the 4 synchronous tools:
     "total_tokens": 3470
   },
   "backend_used": "sdk",
-  "error_details": null
+  "error_details": null,
+  "reasoning": {
+    "rigor": "standard",
+    "toolkit_active": true,
+    "toolkit_source": "/home/you/src/ai-deep-reasoning-toolkit",
+    "toolkit_revision": "a7236c1",
+    "installed": ["GEMINI.md", ".agents/skills/deep-verify"],
+    "gate_line": "Simplicity gate: cut _fmt_row, _DEFAULTS; kept parse (LOAD-BEARING: contract rule 3).",
+    "deep_verify_declined": false,
+    "notes": ""
+  }
 }
 ```
+
+`reasoning` is `null` unless the deep reasoning toolkit is configured — see [§6](#-6-deep-reasoning-toolkit-integration).
 
 #### 2. `ChatResult` (from `agy_chat`)
 ```json
@@ -505,7 +520,177 @@ the first thing to check.
 
 ---
 
-## 🎯 6. High-Yield Prompt Templates for Architect Agents
+## 🧠 6. Deep Reasoning Toolkit Integration
+
+`mcp-agy` can deliver the [**AI Deep Reasoning Toolkit**](https://github.com/DuongNAD/ai-deep-reasoning-toolkit)
+into every workspace it hands to AGY. The toolkit is a rule file (`GEMINI.md`) plus an
+on-demand skill (`deep-verify`) that constrain how Gemini/Antigravity writes code.
+
+The integration is **off unless you switch it on**, and it changes nothing about the architect.
+
+### Why this belongs in the MCP server
+
+Antigravity reads `GEMINI.md` and `.agents/skills/` from the directory it is working in, and
+this server already spawns `agy` with the workspace as its cwd. Claude Code, Cursor and Copilot
+read different filenames, so installing the toolkit changes **the worker's** behaviour and
+leaves **the architect's** untouched:
+
+```
+Claude Code (architect)  ──▶  mcp-agy  ──▶  agy --print  (cwd = workspace)
+   does not read GEMINI.md                    reads GEMINI.md + .agents/skills/
+```
+
+Doing it here rather than by hand buys one thing that matters. The toolkit's own benchmark
+measured `deep-verify` **self-activating in 0 of 10 runs** on a task built to exactly the shape
+the skill describes — and **5 of 5** once the prompt named the trade-offs out loud. Discovery is
+what fails, not the skill. The architect is the only party that knows whether a task has two
+genuinely different designs, so `rigor="deep"` is how it says so.
+
+### Setup
+
+```bash
+git clone https://github.com/DuongNAD/ai-deep-reasoning-toolkit.git ~/src/ai-deep-reasoning-toolkit
+```
+
+Point the server at the checkout in your client config's `env` block:
+
+```json
+{
+  "mcpServers": {
+    "mcp-agy": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/mcp-agy", "run", "mcp-agy"],
+      "env": {
+        "MCP_AGY_BACKEND": "cli",
+        "MCP_AGY_AUTO_FALLBACK": "false",
+        "MCP_AGY_TOOLKIT_PATH": "/home/you/src/ai-deep-reasoning-toolkit"
+      },
+      "timeout": 1800000
+    }
+  }
+}
+```
+
+A path that does not contain `GEMINI.md` logs a warning and disables the integration, rather
+than looking like a working install.
+
+### The `rigor` parameter
+
+Accepted by `agy_execute_task` and `agy_start_task`.
+
+| `rigor` | What happens | When to use it |
+|---|---|---|
+| `"standard"` *(default)* | Installs the toolkit in the workspace. AGY loads the always-on rules; your prompt is passed through untouched. | Everything. This is the setting the measured gains come from. |
+| `"deep"` | Also prepends a preamble naming the `deep-verify` skill and requiring its Comparative Matrix. | Only when the task admits **two or more genuinely different designs** and choosing wrong is expensive to reverse. |
+| `"off"` | Nothing is written, nothing is added. | A workspace you want left exactly as it is. |
+
+**`deep` is not a free upgrade, and this is measured.** On a fully specified contract the
+toolkit's benchmark recorded an identical judge score, **37% more code**, and all five subagent
+tournaments electing the same architecture. Reach for it when you want the alternatives
+*enumerated*, not when you want the answer to be more correct.
+
+`deep` also permits the skill to decline. The skill states that a matrix of one real design
+against two strawmen "launders a foregone conclusion as deliberation", so the preamble tells it
+to decline in one line rather than manufacture alternatives — and that declination comes back
+as `deep_verify_declined: true`.
+
+Asking for `deep` without a configured toolkit does **not** silently downgrade: the result
+carries `toolkit_active: false` and a note saying why, because a plain answer read as the output
+of a verification pipeline is the one failure mode worth being loud about.
+
+### What lands in the workspace
+
+Exactly two paths, and neither is ever overwritten:
+
+```
+<workspace>/GEMINI.md
+<workspace>/.agents/skills/deep-verify/
+```
+
+An existing `GEMINI.md` is left alone and reported in `notes` — it may be your own rules for
+that repo, and there is no meaningful way to merge two rule files.
+
+This happens in `mode="plan"` too. That mode promises AGY will not touch your code, and it
+still does not — but the two toolkit files are written before the investigation starts, because
+that is what makes the rules available to it. `installed` on the result says so every time.
+
+`AGENTS.md` is **never** written. Antigravity reads it, but so does Claude Code, so writing it
+would destroy the worker/architect isolation the whole design rests on.
+
+**Your repository stays clean.** Both paths are registered in `.git/info/exclude`, which is
+local to the clone and never committed. Because `agy_get_diff` and `modified_files` both read
+`git status`, the toolkit disappears from them for free — no skip-list to keep in sync, and
+nothing showing up in your own `git status` either:
+
+```
+$ git status --porcelain
+M src/calc/stats.py          # your change
+
+$ agy_get_diff(workspace)
+"1 file(s) changed: 1 modified (+8, -1)"  ->  ["src/calc/stats.py"]
+```
+
+### What comes back
+
+`TaskExecutionResult.reasoning` records the conditions the run was carried out under. Two runs
+of one task under two rigor settings or two toolkit revisions are two different experiments; a
+result that cannot name its arm cannot be compared against another.
+
+```json
+"reasoning": {
+  "rigor": "standard",
+  "toolkit_active": true,
+  "toolkit_source": "/home/you/src/ai-deep-reasoning-toolkit",
+  "toolkit_revision": "a7236c1",
+  "installed": ["GEMINI.md", ".agents/skills/deep-verify"],
+  "gate_line": "Simplicity gate: cut _fmt_row, _DEFAULTS; kept parse (LOAD-BEARING: contract rule 3).",
+  "deep_verify_declined": false,
+  "notes": ""
+}
+```
+
+`gate_line` is the load-bearing one. `GEMINI.md` §4.4 mandates that line on every response that
+ships code, and states that a missing gate line means the gate did not run. Lifting it out of
+the prose gives the architect a machine-checkable signal that the protocol actually executed —
+the same evidence the toolkit's benchmark uses to conclude its rule file was loaded at all.
+
+Only the two formats the toolkit genuinely mandates are parsed. The Stage 0 tier declaration is
+required to be one line but its wording is left open, and skill *activation* has no declared
+marker, so neither is guessed at: a field that is confidently wrong some of the time is worse
+than no field.
+
+### What the toolkit does and does not buy
+
+From the toolkit's own benchmark — one model, two tasks, ~48 runs, graded by a suite the agent
+never sees:
+
+| | baseline | with toolkit | |
+|---|---|---|---|
+| `safe-path` judge score | 417/420 | 417/420 | unchanged |
+| `safe-path` AST statements | 52.3 | **33.2** | −36% |
+| `event-bus` judge score | 400/400 | 320/320 | unchanged (both perfect) |
+| `event-bus` AST statements | 55.5 | **49.1** | −12% |
+
+Correctness never improved. The toolkit does not make the model *think of* a better solution;
+it stops the model *shipping* things nobody asked for. Install it if you are tired of Gemini
+inventing helpers, metrics and config options on its own. Do not install it expecting it to
+catch bugs.
+
+Those numbers come from one model on two single-file Python tasks with fully specified
+contracts. Ambiguous requirements, multi-file refactors, and legacy codebases are untested —
+and that is exactly the territory the rest of `GEMINI.md` aims at.
+
+### Verified end to end
+
+Against a real `agy` run on a real repository, with `MCP_AGY_AUTO_FALLBACK=false` so a
+simulated answer could not pass: 14/14 checks — both artefacts installed, `AGENTS.md` absent,
+`git status` free of them, `agy_get_diff` and `modified_files` reporting only the real change,
+provenance stamped with the checkout's actual revision, and `gate_line` carrying a
+`Simplicity gate:` line that Gemini emitted because it had read the rules file.
+
+---
+
+## 🎯 7. High-Yield Prompt Templates for Architect Agents
 
 These templates are battle-tested prompts designed for LLMs acting in the **Architect Role** to orchestrate Google Antigravity:
 
@@ -661,7 +846,7 @@ Review AGY's reasoning, architectural trade-offs, and refactoring plan before co
 
 ---
 
-## 🔒 7. Security, Workspace Isolation & Concurrency Locking
+## 🔒 8. Security, Workspace Isolation & Concurrency Locking
 
 When external AI agents manipulate files and run shell commands, filesystem safety is paramount. `mcp-agy` enforces multi-layer defenses:
 
@@ -714,7 +899,7 @@ When external AI agents manipulate files and run shell commands, filesystem safe
 
 ---
 
-## 🔧 8. Environment Variables & Backend Configuration
+## 🔧 9. Environment Variables & Backend Configuration
 
 MCP clients launch this server from a JSON config whose only tunable is the `env` block —
 they cannot append CLI flags. Every variable below is therefore honored from the environment.
@@ -731,10 +916,12 @@ Where an equivalent CLI flag exists, the **explicit flag wins**; the environment
 | `MCP_AGY_EFFORT` | `low`, `medium`, `high` | `None` (agy CLI default) | Default reasoning effort. A per-call `effort` argument overrides it. |
 | `MCP_AGY_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` | Logging verbosity directed strictly to `sys.stderr`. Case-insensitive; an unrecognized value logs a warning and falls back to `INFO` rather than refusing to boot. |
 | `MCP_AGY_DEBUG` | `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off` | `false` | Enables debug mode and raises logging to `DEBUG`. An explicit `MCP_AGY_LOG_LEVEL` still wins over the level this implies. |
+| `MCP_AGY_TOOLKIT_PATH` | Directory path string | `None` (integration off) | Checkout of the [AI Deep Reasoning Toolkit](https://github.com/DuongNAD/ai-deep-reasoning-toolkit). When set, `rigor` on `agy_execute_task` / `agy_start_task` becomes live and results carry a `reasoning` profile. A path without a `GEMINI.md` in it logs a warning and stays off. See [§6](#-6-deep-reasoning-toolkit-integration). |
+| `MCP_AGY_JOB_MARKER_DIR` | Directory path string | System temp dir | Where background-job `.done` markers and persisted results are written. Redirect it to keep one machine's job records isolated (the test suite does). |
 
 ---
 
-## 🧪 9. Development, Testing & Verification
+## 🧪 10. Development, Testing & Verification
 
 ### Running the Full Test Suite:
 
@@ -765,7 +952,7 @@ python -m mcp_agy --debug 2> stderr.log
 
 ---
 
-## ❓ 10. Troubleshooting & FAQ
+## ❓ 11. Troubleshooting & FAQ
 
 - **Q: Claude Desktop reports "Could not connect to MCP server"?**
   - *A*: Ensure `uv` is installed and reachable in your system `PATH`. Check `claude_desktop_config.json` to ensure JSON syntax is valid and all file paths use escaped backslashes `\\` on Windows.
@@ -784,7 +971,7 @@ python -m mcp_agy --debug 2> stderr.log
 
 ---
 
-## 📜 11. License & Contributing
+## 📜 12. License & Contributing
 
 - Distributed under the **MIT License**. See `LICENSE` for details.
 - Contributions, bug reports, and feature requests are welcome via GitHub Pull Requests and Issues.

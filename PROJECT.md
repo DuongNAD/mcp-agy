@@ -73,6 +73,9 @@ The `mcp_agy` package exposes Google Antigravity (AGY) as an autonomous coding w
 | 20 | Professional Documentation | Comprehensive `README.md`, architecture, client setup guides, prompt templates | M4 | user requirement |
 | 21 | Automated E2E Test Suite | Requirement-driven opaque-box test suite (Tiers 1-4) | E2E / M5 | survey |
 | 22 | Adversarial Hardening & Audit | White-box adversarial testing (Tier 5) and forensic integrity verification | M5 | survey |
+| 23 | Deep Reasoning Toolkit Delivery | Provisioning `GEMINI.md` + `deep-verify` into the workspace, hidden from git via `.git/info/exclude` | M6 | user requirement |
+| 24 | Tool: `rigor` parameter | `standard`/`deep`/`off` on task tools; `deep` names the skill the benchmark showed is never self-discovered | M6 | user requirement |
+| 25 | Reasoning Provenance & Gate Report | `ReasoningProfile` on results: rigor, toolkit revision, and the mandated `Simplicity gate:` line lifted from the response | M6 | user requirement |
 
 ---
 
@@ -85,6 +88,7 @@ The `mcp_agy` package exposes Google Antigravity (AGY) as an autonomous coding w
 | 3 | Diff Inspection & Test Runner | Git unified diff engine (tracked + untracked) and multi-ecosystem test runner | M1 contracts | DONE |
 | 4 | Workspace Safety, Packaging & Docs | Workspace isolation, client configs, `pyproject.toml`, and comprehensive documentation | M1, M2, M3 | DONE |
 | 5 | E2E Integration & Final Audit | 100% E2E test pass (Tiers 1-4), Tier 5 adversarial hardening, and forensic audit | E2E, M1-M4 | DONE |
+| 6 | Deep Reasoning Toolkit Integration | Optional delivery of https://github.com/DuongNAD/ai-deep-reasoning-toolkit into the worker's workspace, with provenance and gate reporting on results | M1, M2 | DONE |
 
 ---
 
@@ -112,6 +116,17 @@ class TaskExecutionResult(BaseModel):
     tokens_used: TokenUsage = Field(default_factory=TokenUsage)
     backend_used: str = "cli"
     error_details: str | None = None
+    reasoning: ReasoningProfile | None = None
+
+class ReasoningProfile(BaseModel):
+    rigor: Literal["off", "standard", "deep"] = "off"
+    toolkit_active: bool = False
+    toolkit_source: str = ""
+    toolkit_revision: str = ""
+    installed: list[str] = Field(default_factory=list)
+    gate_line: str = ""
+    deep_verify_declined: bool = False
+    notes: str = ""
 
 class ChatResult(BaseModel):
     status: Literal["success", "error", "timeout"]
