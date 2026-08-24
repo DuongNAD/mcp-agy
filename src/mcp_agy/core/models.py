@@ -138,6 +138,52 @@ class ExecutionRequest(BaseModel):
     extra_args: Dict[str, Any] = Field(default_factory=dict, description="Additional backend-specific arguments")
 
 
+class ReasoningProfile(BaseModel):
+    """Which reasoning protocol a run was carried out under, and what it reported back.
+
+    Attached to a result so a run can name its own conditions. Two runs of one task under two
+    rigor settings, or two toolkit revisions, are two different experiments; a result that
+    cannot say which one it was cannot be compared against another.
+
+    See https://github.com/DuongNAD/ai-deep-reasoning-toolkit
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    rigor: Literal["off", "standard", "deep"] = Field(
+        default="off",
+        description="Rigor requested for this run: 'off' (no toolkit), 'standard' (rules only), 'deep' (also names the deep-verify skill)",
+    )
+    toolkit_active: bool = Field(
+        default=False,
+        description="True when the toolkit was present in the workspace for this run",
+    )
+    toolkit_source: str = Field(
+        default="",
+        description="Filesystem path of the toolkit checkout the files came from",
+    )
+    toolkit_revision: str = Field(
+        default="",
+        description="Short git revision of that checkout, when it is a git repo",
+    )
+    installed: list[str] = Field(
+        default_factory=list,
+        description="Toolkit paths this call wrote into the workspace (empty when they were already there)",
+    )
+    gate_line: str = Field(
+        default="",
+        description="The 'Simplicity gate: ...' line GEMINI.md section 4.4 requires on any response that ships code. Empty means it was not reported, which by that section means the gate did not run",
+    )
+    deep_verify_declined: bool = Field(
+        default=False,
+        description="True when the deep-verify skill explicitly declined to activate. Declining is a valid, expected outcome for a single-design problem",
+    )
+    notes: str = Field(
+        default="",
+        description="Anything the caller should know: files left untouched, a checkout that could not be read",
+    )
+
+
 class TaskExecutionResult(BaseModel):
     """Result returned from an autonomous task execution in the target workspace."""
 
@@ -178,6 +224,10 @@ class TaskExecutionResult(BaseModel):
     error_details: Optional[str] = Field(
         default=None,
         description="Detailed error trace or message if status != success",
+    )
+    reasoning: Optional[ReasoningProfile] = Field(
+        default=None,
+        description="Reasoning protocol this run was carried out under. None when the toolkit integration is switched off",
     )
 
 

@@ -36,10 +36,12 @@ from mcp_agy.core.models import (
     JobHandle,
     JobListResult,
     JobStatusResult,
+    ReasoningProfile,
     TaskExecutionResult,
     TestRunResult,
     TestSummary,
 )
+from mcp_agy.core import reasoning_toolkit
 from mcp_agy.core.test_runner import MultiEcosystemTestRunner, execute_workspace_tests
 from mcp_agy.utils.logger import configure_logging, get_logger
 from mcp_agy.utils.workspace import (
@@ -58,6 +60,89 @@ SERVER_INSTRUCTIONS = (
     "Enables executing coding tasks, analytical discussions, git diff inspections, "
     "and automated test runner execution within specified project workspaces."
 )
+
+
+RIGOR_DESCRIPTION = (
+    "Reasoning protocol for this run, via the AI Deep Reasoning Toolkit "
+    "(https://github.com/DuongNAD/ai-deep-reasoning-toolkit). Inert unless MCP_AGY_TOOLKIT_PATH "
+    "names a checkout.\n"
+    "- 'standard' (default): put GEMINI.md and the deep-verify skill in the workspace so AGY "
+    "loads the always-on rules. Measured on the toolkit's own benchmark: same judge score as "
+    "baseline, 36% and 12% fewer statements on its two tasks.\n"
+    "- 'deep': also names the deep-verify skill in the prompt, which spawns parallel subagents "
+    "and forces a comparative matrix. Ask for this ONLY when the task genuinely admits two or "
+    "more different designs and choosing wrong is expensive. On a fully specified contract the "
+    "same benchmark measured an identical score and 37% MORE code, so it is not a free upgrade.\n"
+    "- 'off': leave the workspace alone."
+)
+
+
+def _prepare_reasoning(
+    workspace: Path, prompt: str, rigor: str
+) -> tuple[str, Optional[ReasoningProfile]]:
+    """Provision the toolkit and, for 'deep', name the skill in the prompt.
+
+    Returns the prompt to actually send and the profile to stamp on the result.
+
+    A profile comes back whenever the toolkit is configured, and also when the caller asked for
+    'deep' and it is not - that request must not fail silently, or the architect reads a plain
+    AGY answer as the output of a verification pipeline that never ran.
+
+    Never raises. A checkout that cannot be copied downgrades the run to plain AGY and says so
+    in `notes`: failing a coding task over a rules file would be the worse trade.
+    """
+    root = reasoning_toolkit.toolkit_root()
+    if root is None:
+        if rigor != "deep":
+            return prompt, None
+        return prompt, ReasoningProfile(
+            rigor="off",
+            notes=(
+                f"rigor='deep' requested but {reasoning_toolkit.TOOLKIT_ENV} is not set to a "
+                f"valid checkout, so the deep-verify skill was not available. Clone "
+                f"{reasoning_toolkit.TOOLKIT_URL} and point that variable at it."
+            ),
+        )
+
+    if rigor == "off":
+        return prompt, ReasoningProfile(rigor="off", toolkit_source=str(root), notes="not installed by request")
+
+    try:
+        installed, notes = reasoning_toolkit.provision(workspace, root)
+    except OSError as exc:
+        logger.warning(f"Reasoning toolkit could not be installed into '{workspace}': {exc}")
+        return prompt, ReasoningProfile(
+            rigor="off",
+            toolkit_source=str(root),
+            notes=f"install failed, run proceeded without the toolkit: {exc}",
+        )
+
+    profile = ReasoningProfile(
+        rigor="deep" if rigor == "deep" else "standard",
+        toolkit_active=True,
+        toolkit_source=str(root),
+        toolkit_revision=reasoning_toolkit.toolkit_revision(root),
+        installed=installed,
+        notes=notes,
+    )
+    if rigor == "deep":
+        return reasoning_toolkit.deep_verify_preamble() + prompt, profile
+    return prompt, profile
+
+
+def _stamp_reasoning(
+    result: TaskExecutionResult, profile: Optional[ReasoningProfile]
+) -> TaskExecutionResult:
+    """Attach the profile to a finished result, filling in what AGY reported back."""
+    if profile is None:
+        return result
+
+    if profile.toolkit_active:
+        profile.gate_line, profile.deep_verify_declined = reasoning_toolkit.read_protocol_report(
+            result.response
+        )
+    result.reasoning = profile
+    return result
 
 
 def create_mcp_server(
@@ -178,6 +263,10 @@ def create_mcp_server(
                 description="Optional reasoning effort for this task: 'low', 'medium', or 'high'. Empty uses MCP_AGY_EFFORT, else the agy CLI default.",
             ),
         ] = "",
+        rigor: Annotated[
+            Literal["standard", "deep", "off"],
+            Field(description=RIGOR_DESCRIPTION),
+        ] = "standard",
     ) -> TaskExecutionResult:
         """Executes an autonomous multi-step coding task in a target workspace using Google Antigravity (AGY)."""
         logger.info(f"agy_execute_task invoked for workspace='{workspace_path}', mode='{mode}'")
@@ -226,24 +315,34 @@ def create_mcp_server(
         # `plan` cannot write, so it takes a reader lock: two investigations of one repo run
         # together instead of queueing. `accept-edits` stays exclusive.
         async with lock_mgr.lock(validated_ws, shared=(mode == "plan")):
+            # Inside the lock: provisioning writes into the workspace, and the prompt it may
+            # extend has to be the one the backend actually receives.
+            effective_prompt, profile = _prepare_reasoning(validated_ws, prompt, rigor)
+
             if backend_executor is not None:
-                return await backend_executor(
+                return _stamp_reasoning(
+                    await backend_executor(
+                        workspace_path=normalized_workspace,
+                        prompt=effective_prompt,
+                        auto_approve=auto_approve,
+                        mode=mode,
+                        timeout_seconds=timeout_seconds,
+                        **extra,
+                    ),
+                    profile,
+                )
+
+            active_backend = _resolve_backend()
+            return _stamp_reasoning(
+                await active_backend.execute_task(
                     workspace_path=normalized_workspace,
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     auto_approve=auto_approve,
                     mode=mode,
                     timeout_seconds=timeout_seconds,
                     **extra,
-                )
-
-            active_backend = _resolve_backend()
-            return await active_backend.execute_task(
-                workspace_path=normalized_workspace,
-                prompt=prompt,
-                auto_approve=auto_approve,
-                mode=mode,
-                timeout_seconds=timeout_seconds,
-                **extra,
+                ),
+                profile,
             )
 
     @server.tool(
@@ -607,6 +706,10 @@ def create_mcp_server(
                 description="Optional reasoning effort: 'low', 'medium', or 'high'. Leave empty when the model id already encodes one - the CLI rejects the combination.",
             ),
         ] = "",
+        rigor: Annotated[
+            Literal["standard", "deep", "off"],
+            Field(description=RIGOR_DESCRIPTION),
+        ] = "standard",
     ) -> JobHandle:
         """Starts an AGY run in the background and returns a job id immediately."""
         logger.info(f"agy_start_task invoked for workspace='{workspace_path}', mode='{mode}'")
@@ -643,23 +746,31 @@ def create_mcp_server(
             # actually run at once. Under the old mutex they reported `running_count: 3` while
             # only one `agy.EXE` existed - the queueing was invisible from the outside.
             async with lock_mgr.lock(validated_ws, shared=(mode == "plan")):
+                effective_prompt, profile = _prepare_reasoning(validated_ws, prompt, rigor)
+
                 if backend_executor is not None:
-                    return await backend_executor(
+                    return _stamp_reasoning(
+                        await backend_executor(
+                            workspace_path=normalized_workspace,
+                            prompt=effective_prompt,
+                            auto_approve=auto_approve,
+                            mode=mode,
+                            timeout_seconds=timeout_seconds,
+                            **extra,
+                        ),
+                        profile,
+                    )
+                active_backend = _resolve_backend()
+                return _stamp_reasoning(
+                    await active_backend.execute_task(
                         workspace_path=normalized_workspace,
-                        prompt=prompt,
+                        prompt=effective_prompt,
                         auto_approve=auto_approve,
                         mode=mode,
                         timeout_seconds=timeout_seconds,
                         **extra,
-                    )
-                active_backend = _resolve_backend()
-                return await active_backend.execute_task(
-                    workspace_path=normalized_workspace,
-                    prompt=prompt,
-                    auto_approve=auto_approve,
-                    mode=mode,
-                    timeout_seconds=timeout_seconds,
-                    **extra,
+                    ),
+                    profile,
                 )
 
         job = get_job_manager().start(

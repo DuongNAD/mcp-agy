@@ -25,6 +25,7 @@ from mcp_agy.core.models import (
     ChatResult,
     DiffResult,
     FileDiffStat,
+    ReasoningProfile,
     TaskExecutionResult,
     TestFailure,
     TestRunResult,
@@ -73,6 +74,7 @@ __all__ = [
     "cli_main",
     # Core Pydantic models
     "TokenUsage",
+    "ReasoningProfile",
     "TaskExecutionResult",
     "ChatResult",
     "FileDiffStat",
