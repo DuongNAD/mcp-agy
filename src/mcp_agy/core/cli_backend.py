@@ -110,6 +110,30 @@ async def _detect_changed_files(workspace_path: str, since_wall_ts: float) -> Se
     return changed
 
 
+def _relativize_to_workspace(target: str, workspace_path: str) -> str:
+    """Render a path agy reported as workspace-relative, whichever OS reported it.
+
+    The previous version asked `os.path.isabs` and `os.path.relpath`, both of which answer for
+    the host running *this* server rather than the host that produced the telemetry line. A
+    Windows-side run reporting `E:\\repo\\src\\auth.py` against workspace `E:\\repo` therefore
+    came back as `E:/repo/src/auth.py` from a POSIX server: `isabs` says False for a drive
+    letter, so the relativize branch was never entered and the caller was handed an absolute
+    foreign path where `modified_files` promises a workspace-relative one.
+
+    Folding both sides to forward slashes and stripping the prefix textually answers the same
+    question without asking the local OS about a foreign path. A target that is not under the
+    workspace keeps its full path - it is still the truest thing we can say about it.
+    """
+    normalized = target.replace("\\", "/")
+    if not workspace_path:
+        return normalized
+
+    prefix = workspace_path.replace("\\", "/").rstrip("/") + "/"
+    if normalized.startswith(prefix):
+        return normalized[len(prefix) :]
+    return normalized
+
+
 def find_agy_executable() -> Optional[str]:
     """Locate agy executable binary across environment variables, PATH, and standard directories."""
     # 1. Custom environment variable override
@@ -480,17 +504,9 @@ class SubprocessCLIBackend(AGYBackend):
                                 params = _safe_dict(tool_info.get("parameters"))
                                 target = params.get("TargetFile") or params.get("file_path") or params.get("path")
                                 if target and isinstance(target, str):
-                                    if request.workspace_path and os.path.isabs(target):
-                                        try:
-                                            rel = os.path.relpath(target, request.workspace_path)
-                                            if not rel.startswith(".."):
-                                                modified_files.add(rel.replace("\\", "/"))
-                                            else:
-                                                modified_files.add(target.replace("\\", "/"))
-                                        except ValueError:
-                                            modified_files.add(target.replace("\\", "/"))
-                                    else:
-                                        modified_files.add(str(target).replace("\\", "/"))
+                                    modified_files.add(
+                                        _relativize_to_workspace(target, request.workspace_path)
+                                    )
 
                             if state == "DONE":
                                 params = _safe_dict(tool_info.get("parameters"))
