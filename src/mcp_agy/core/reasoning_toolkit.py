@@ -107,6 +107,38 @@ def toolkit_revision(root: Path) -> str:
     return revision
 
 
+def _exclude_file(workspace: Path) -> Optional[Path]:
+    """The file git reads local ignore rules from for this checkout, or None if it is not one.
+
+    `.git` is a directory in an ordinary clone but a plain file in a linked `git worktree`, so
+    `workspace/.git/info/exclude` does not exist there and the toolkit's files showed up as
+    untracked in every diff of every worktree - the layout used to run tasks in parallel. A
+    worktree reads its rules from the *common* directory, so the rules land in the shared file
+    and also apply to the main checkout and sibling worktrees. Asking git avoids re-deriving
+    that lookup, which varies with the git version and with how the worktree was made.
+    """
+    dot_git = workspace / ".git"
+    if not dot_git.exists():
+        return None
+
+    try:
+        proc = subprocess.run(
+            [shutil.which("git") or "git", "-C", str(workspace), "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        out = proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception as exc:  # git missing, timeout
+        logger.debug(f"Could not ask git for the exclude file of '{workspace}': {exc}")
+        out = ""
+
+    if out:
+        path = Path(out)
+        return path if path.is_absolute() else workspace / path
+    return dot_git / "info" / "exclude" if dot_git.is_dir() else None
+
+
 def _hide_from_git(workspace: Path, entries: list[str]) -> None:
     """Register installed paths in `.git/info/exclude` so they stay out of the user's repo.
 
@@ -120,13 +152,12 @@ def _hide_from_git(workspace: Path, entries: list[str]) -> None:
     is never committed, so nothing here ends up in the user's history. A workspace that is not a
     git repo simply has nowhere to write, which is not an error.
     """
-    info_dir = workspace / ".git" / "info"
-    if not (workspace / ".git").is_dir():
+    exclude = _exclude_file(workspace)
+    if exclude is None:
         return
 
-    exclude = info_dir / "exclude"
     try:
-        info_dir.mkdir(parents=True, exist_ok=True)
+        exclude.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
         missing = [e for e in entries if e not in existing.splitlines()]
         if not missing:

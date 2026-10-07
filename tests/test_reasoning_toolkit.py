@@ -198,6 +198,31 @@ class TestGitInvisibility:
         assert "scratch/" in content
         assert "/GEMINI.md" in content
 
+    def test_a_linked_worktree_stays_clean_too(self, fake_toolkit, git_workspace, tmp_path):
+        """In a worktree `.git` is a file, so there is no `.git/info/` to write into.
+
+        Parallel tasks are meant to each run in their own worktree, so this is the layout the
+        toolkit has to work in - not an edge case.
+        """
+        worktree = tmp_path / "task-1"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "task-1", str(worktree)],
+            cwd=git_workspace,
+            check=True,
+        )
+        assert (worktree / ".git").is_file(), "fixture is not a linked worktree"
+
+        installed, _ = reasoning_toolkit.provision(worktree, fake_toolkit)
+
+        assert "GEMINI.md" in installed
+        out = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert out.strip() == "", f"toolkit files leaked into the worktree's git status:\n{out}"
+
 
 # ============================================================================
 # 2. Reading the protocol's mandated one-liners
