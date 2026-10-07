@@ -55,25 +55,21 @@ logger = get_logger("mcp_agy.server")
 
 SERVER_NAME = "mcp-agy"
 SERVER_INSTRUCTIONS = (
-    "FastMCP server exposing Google Antigravity (AGY) as an autonomous coding worker "
-    "for external AI architect agents (Claude Desktop, Cursor, Cline, Roo Code). "
-    "Enables executing coding tasks, analytical discussions, git diff inspections, "
-    "and automated test runner execution within specified project workspaces."
+    "Google Antigravity (AGY) as a coding worker: delegate implementation, analysis, diffs and tests.\n"
+    "Write each prompt in English. AGY cannot see this chat, so every prompt must stand alone:\n"
+    "GOAL: one sentence. FILES: exact paths. RULES: constraints, style, what not to touch. "
+    "DONE WHEN: checkable criteria. REPLY: at most 5 lines - what changed, test result, blockers.\n"
+    "Many tasks: start each with agy_start_task, then collect with agy_job_status. Writes to one "
+    "workspace run one at a time, so give each write task its own git worktree; mode='plan' "
+    "tasks may share a workspace. Verify with agy_get_diff and agy_run_tests, not AGY's own claims."
 )
 
 
 RIGOR_DESCRIPTION = (
-    "Reasoning protocol for this run, via the AI Deep Reasoning Toolkit "
-    "(https://github.com/DuongNAD/ai-deep-reasoning-toolkit). Inert unless MCP_AGY_TOOLKIT_PATH "
-    "names a checkout.\n"
-    "- 'standard' (default): put GEMINI.md and the deep-verify skill in the workspace so AGY "
-    "loads the always-on rules. Measured on the toolkit's own benchmark: same judge score as "
-    "baseline, 36% and 12% fewer statements on its two tasks.\n"
-    "- 'deep': also names the deep-verify skill in the prompt, which spawns parallel subagents "
-    "and forces a comparative matrix. Ask for this ONLY when the task genuinely admits two or "
-    "more different designs and choosing wrong is expensive. On a fully specified contract the "
-    "same benchmark measured an identical score and 37% MORE code, so it is not a free upgrade.\n"
-    "- 'off': leave the workspace alone."
+    "Reasoning protocol (needs MCP_AGY_TOOLKIT_PATH). 'standard' (default): load the toolkit's "
+    "rules into the workspace. 'deep': also run the deep-verify skill - only for tasks with two "
+    "or more genuinely different designs where a wrong choice is costly; on a fully specified "
+    "task it adds ~37% more code for the same score. 'off': touch nothing."
 )
 
 
@@ -194,53 +190,33 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_execute_task",
-        description=(
-            "Executes an autonomous multi-step coding task in a target workspace using Google Antigravity (AGY).\n\n"
-            "Spawns a specialized AGY autonomous coding agent inside the specified repository or project "
-            "directory. AGY investigates the codebase, writes new files, modifies existing code, refactors "
-            "modules, executes build or setup commands, and returns structured telemetry and execution results.\n\n"
-            "Architect Guidance:\n"
-            "- Use this tool when you need AGY to implement concrete features, fix bugs, refactor code, "
-            "or perform multi-file code modifications in a workspace.\n"
-            "- For read-only planning or architectural queries without modifying files, set mode='plan' "
-            "or use the dedicated `agy_chat` tool.\n"
-            "- Always provide clear, self-contained prompts with explicit requirements, constraints, "
-            "file paths, and acceptance criteria.\n\n"
-            "Args:\n"
-            "    workspace_path: Absolute or relative filesystem path to the target repository. Must exist.\n"
-            "    prompt: Clear, detailed instructions for AGY (e.g. 'Implement auth in src/auth.py and add pytest tests').\n"
-            "    auto_approve: Automatically approve tool calls and file edits (default: True).\n"
-            "    mode: Agent mode: 'accept-edits' for full coding/editing (default), or 'plan' for read-only plan generation.\n"
-            "    timeout_seconds: Maximum execution time in seconds (default: 600s, min: 1, max: 3600).\n\n"
-            "Returns:\n"
-            "    TaskExecutionResult containing status, conversation_id, response, modified_files, diff_summary, duration_seconds, tokens_used, backend_used, and error_details."
-        ),
+        description="Run an autonomous coding task in a workspace with AGY and wait for it to finish (blocks).\n\nArchitect Guidance:\n- Use only for work that ends in under ~30s; anything longer belongs in agy_start_task, because clients drop long calls.\n- mode='plan' is read-only analysis. Edits to one workspace run one at a time.\n- Confirm what changed with agy_get_diff; do not rely on AGY's own summary.",
     )
     async def agy_execute_task(
         workspace_path: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Absolute or relative filesystem path to the target workspace/repository where AGY will execute coding operations. Must be an existing directory.",
+                description="Existing directory AGY works in.",
             ),
         ],
         prompt: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Comprehensive natural language instructions detailing the coding task, requirements, expected file changes, architecture rules, or terminal commands for AGY to execute.",
+                description="Self-contained task: goal, files, rules, done-when, reply format.",
             ),
         ],
         auto_approve: Annotated[
             bool,
             Field(
-                description="When True (default), automatically approves all AGY tool executions (file creation, edits, terminal commands) without blocking for interactive user confirmation.",
+                description="Auto-approve AGY's tool calls and edits.",
             ),
         ] = True,
         mode: Annotated[
             Literal["accept-edits", "plan"],
             Field(
-                description="Execution mode for AGY: 'accept-edits' (default) enables full autonomous coding with file creation and modification; 'plan' runs read-only analysis without making changes.",
+                description="'accept-edits' edits files; 'plan' is read-only.",
             ),
         ] = "accept-edits",
         timeout_seconds: Annotated[
@@ -248,19 +224,19 @@ def create_mcp_server(
             Field(
                 ge=1,
                 le=3600,
-                description="Maximum execution duration in seconds before the task is cancelled (default: 600 seconds / 10 minutes). Minimum: 1, Maximum: 3600.",
+                description="Max run time in seconds.",
             ),
         ] = 600,
         model: Annotated[
             str,
             Field(
-                description="Optional model id for this task (e.g. 'gemini-3.7-flash-high', 'gemini-3.1-pro-high'). Empty uses MCP_AGY_MODEL, else the agy CLI default. Run `agy models` to list valid ids.",
+                description="Model id, e.g. 'gemini-3.8-flash-high'. Empty uses MCP_AGY_MODEL. List: `agy models`.",
             ),
         ] = "",
         effort: Annotated[
             str,
             Field(
-                description="Optional reasoning effort for this task: 'low', 'medium', or 'high'. Empty uses MCP_AGY_EFFORT, else the agy CLI default.",
+                description="'low'|'medium'|'high'. Leave empty when the model id already carries an effort; the CLI rejects both.",
             ),
         ] = "",
         rigor: Annotated[
@@ -347,43 +323,26 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_chat",
-        description=(
-            "Submits an analytical, planning, or architectural question to Google Antigravity (AGY) without modifying files.\n\n"
-            "Consults AGY as an expert reasoning partner. Ideal for repository exploration, code review, "
-            "design discussions, architecture planning, and troubleshooting without making any edits to disk.\n\n"
-            "Architect Guidance:\n"
-            "- Use this tool when you want AGY's insights, code explanations, or architectural recommendations "
-            "before commanding code modifications.\n"
-            "- Pass `workspace_path` if the query pertains to a specific codebase on disk so AGY can inspect files. "
-            "(In chat mode, AGY will strictly NOT edit or create files).\n"
-            "- Pass `conversation_id` to continue an ongoing multi-turn dialogue session.\n\n"
-            "Args:\n"
-            "    prompt: The question, review request, or planning prompt.\n"
-            "    workspace_path: Optional path to workspace directory for context.\n"
-            "    conversation_id: Optional UUID of previous conversation to resume.\n"
-            "    timeout_seconds: Maximum time to wait for response (default: 300s, min: 1, max: 1800).\n\n"
-            "Returns:\n"
-            "    ChatResult containing status, conversation_id, response, duration_seconds, tokens_used, backend_used, and error_details."
-        ),
+        description="Ask AGY a read-only question about a codebase or a design. It never edits files.\n\nArchitect Guidance:\n- Pass workspace_path so AGY can read the code.\n- Pass conversation_id to continue an earlier thread.\n- Use model='gemini-3.1-pro-high' for hard design questions.",
     )
     async def agy_chat(
         prompt: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Natural language question, planning query, codebase analysis prompt, or architectural consultation for AGY.",
+                description="Question or analysis request.",
             ),
         ],
         workspace_path: Annotated[
             str,
             Field(
-                description="Optional filesystem path to a workspace/repository to provide codebase context for analysis. If empty, AGY operates in general consultation mode.",
+                description="Optional directory for code context.",
             ),
         ] = "",
         conversation_id: Annotated[
             str,
             Field(
-                description="Optional conversation ID to resume or continue an ongoing multi-turn dialogue session with AGY. If empty, a new conversation is started.",
+                description="Optional id of a conversation to continue.",
             ),
         ] = "",
         timeout_seconds: Annotated[
@@ -391,19 +350,19 @@ def create_mcp_server(
             Field(
                 ge=1,
                 le=1800,
-                description="Maximum consultation duration in seconds before timing out (default: 300 seconds / 5 minutes). Minimum: 1, Maximum: 1800.",
+                description="Max seconds.",
             ),
         ] = 300,
         model: Annotated[
             str,
             Field(
-                description="Optional model id for this consultation (e.g. 'gemini-3.1-pro-high' for hard architectural questions). Empty uses MCP_AGY_MODEL, else the agy CLI default.",
+                description="Model id, e.g. 'gemini-3.8-flash-high'. Empty uses MCP_AGY_MODEL. List: `agy models`.",
             ),
         ] = "",
         effort: Annotated[
             str,
             Field(
-                description="Optional reasoning effort: 'low', 'medium', or 'high'. Empty uses MCP_AGY_EFFORT, else the agy CLI default.",
+                description="'low'|'medium'|'high'. Leave empty when the model id already carries an effort; the CLI rejects both.",
             ),
         ] = "",
     ) -> ChatResult:
@@ -459,27 +418,14 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_get_diff",
-        description=(
-            "Inspects git status and generates a unified diff of all changes in the target workspace.\n\n"
-            "Captures all modifications made in the repository, including staged changes, unstaged edits "
-            "in tracked files, and newly created untracked files. Provides structured file diff statistics "
-            "(insertions, deletions, change types) and a complete unified diff.\n\n"
-            "Architect Guidance:\n"
-            "- Call this tool after `agy_execute_task` to verify exact code changes made by AGY before approving or proceeding.\n"
-            "- Handles empty/unborn git repositories, untracked new files, and clean workspaces gracefully.\n"
-            "- If the target folder is not a git repository, returns status 'not_a_git_repo' with a list of workspace files.\n\n"
-            "Args:\n"
-            "    workspace_path: Path to the workspace directory. Must exist.\n\n"
-            "Returns:\n"
-            "    DiffResult containing status ('success', 'error', 'not_a_git_repo'), has_changes, unified_diff, changed_files, untracked_files, summary, and error_details."
-        ),
+        description="Show what changed in a git workspace: staged, unstaged and untracked files, per-file stats, unified diff.\n\nArchitect Guidance:\n- Run it after a task to verify AGY's work before accepting it.\n- A folder that is not a git repo returns status 'not_a_git_repo'.",
     )
     async def agy_get_diff(
         workspace_path: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Absolute or relative path to the git workspace directory to inspect for changes.",
+                description="Git workspace directory.",
             ),
         ],
     ) -> DiffResult:
@@ -523,36 +469,20 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_run_tests",
-        description=(
-            "Runs test suites in the target workspace and returns structured outcomes, summary counts, and failure diagnostics.\n\n"
-            "Automatically detects installed test frameworks (pytest, unittest, npm/jest/vitest, cargo, "
-            "go test, maven, gradle, dotnet, etc.) or runs a custom user-specified test command. "
-            "Captures exit codes, total/passed/failed counts, test durations, and failure tracebacks.\n\n"
-            "Architect Guidance:\n"
-            "- Call this tool after AGY makes code changes to verify test pass rates and identify any regressions.\n"
-            "- If `test_command` is omitted, the runner checks workspace configuration files (e.g. `pytest.ini`, "
-            "`pyproject.toml`, `package.json`, `Cargo.toml`, etc.) and workspace virtualenvs to auto-run tests.\n"
-            "- Sanitizes terminal ANSI color codes and captures failure locations for easy LLM debugging.\n\n"
-            "Args:\n"
-            "    workspace_path: Path to the workspace repository. Must exist.\n"
-            "    test_command: Optional custom command string to run tests (e.g. 'pytest -k test_auth').\n"
-            "    timeout_seconds: Maximum test run duration before killing test process tree (default: 300s, min: 1, max: 1800).\n\n"
-            "Returns:\n"
-            "    TestRunResult containing status ('passed', 'failed', 'error', 'timeout', 'no_framework_detected'), exit_code, framework, test_command_executed, output, summary, failures, duration_seconds, and error_details."
-        ),
+        description="Run a workspace's tests and return pass/fail counts and failure traces.\n\nArchitect Guidance:\n- Omit test_command to auto-detect the framework (pytest, npm, cargo, go, maven, gradle, dotnet...).\n- Run it after changes to catch regressions.",
     )
     async def agy_run_tests(
         workspace_path: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Absolute or relative path to the target workspace directory where tests will be executed.",
+                description="Workspace directory.",
             ),
         ],
         test_command: Annotated[
             str,
             Field(
-                description="Optional explicit test command to execute (e.g. 'pytest tests/ -v', 'npm test', 'cargo test'). If empty, the test runner automatically detects the framework.",
+                description="Optional command, e.g. 'pytest -k auth'. Empty auto-detects.",
             ),
         ] = "",
         timeout_seconds: Annotated[
@@ -560,7 +490,7 @@ def create_mcp_server(
             Field(
                 ge=1,
                 le=1800,
-                description="Maximum test suite execution time in seconds (default: 300 seconds / 5 minutes). Minimum: 1, Maximum: 1800.",
+                description="Max seconds.",
             ),
         ] = 300,
     ) -> TestRunResult:
@@ -631,59 +561,33 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_start_task",
-        description=(
-            "Starts an AGY coding or analysis run in the background and returns a job id immediately.\n\n"
-            "Use this instead of `agy_execute_task` for anything that takes more than about half a "
-            "minute - which is most real work. Every MCP client caps how long it waits for a single "
-            "tool call (Claude Code: 60 seconds by default, configurable higher; shipped configs use "
-            "30 minutes), so a synchronous call to a task that runs for minutes is dropped by the "
-            "client and its work is lost. This tool returns at once; AGY keeps working in the server; "
-            "you collect the result later with `agy_job_status`.\n\n"
-            "Architect Guidance:\n"
-            "- Start the job, then do something else - inspect files, plan the next step, start another "
-            "job in a different workspace - and collect the result when you need it.\n"
-            "- The recommended way to wait on completion is checking the `done_marker_path` file on disk "
-            "(e.g. `until [ -f <path> ]; do sleep 5; done`) rather than polling `agy_job_status` repeatedly, "
-            "then calling `agy_job_status` once to collect the result.\n"
-            "- Alternatively, pass `wait_seconds` to `agy_job_status` to block until the job finishes.\n"
-            "- mode='plan' is the read-only form: AGY investigates and reports without touching files.\n"
-            "- Jobs live in the server process. If the server restarts, `agy_job_status` reports "
-            "'not_found' and the run must be re-issued.\n\n"
-            "Args:\n"
-            "    workspace_path: Absolute or relative path to the target repository. Must exist.\n"
-            "    prompt: Clear, detailed, self-contained instructions for AGY.\n"
-            "    auto_approve: Automatically approve tool calls and file edits (default: True).\n"
-            "    mode: 'accept-edits' for full coding/editing (default), or 'plan' for read-only analysis.\n"
-            "    timeout_seconds: Maximum execution time for the run itself (default: 600s, max: 3600).\n\n"
-            "Returns:\n"
-            "    JobHandle containing status, job_id, kind, workspace_path, started_at, done_marker_path, and error_details."
-        ),
+        description="Start an AGY task in the background and return a job_id at once. Prefer this to agy_execute_task for anything over ~30s.\n\nArchitect Guidance:\n- Start several jobs, do other work, then collect each with agy_job_status.\n- To wait: poll `done_marker_path` on disk (`until [ -f <path> ]; do sleep 5; done`), or use agy_job_status(wait_seconds=...) kept below your client's per-call timeout.\n- mode='plan' is read-only and plan jobs may share a workspace; write jobs on one workspace queue behind each other.\n- After a server restart, finished results are recovered from disk; running jobs are lost - re-issue them.\n- MCP_AGY_MAX_CONCURRENCY caps simultaneous AGY processes; extra jobs wait their turn.",
     )
     async def agy_start_task(
         workspace_path: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Absolute or relative filesystem path to the target workspace/repository where AGY will work. Must be an existing directory.",
+                description="Existing directory AGY works in.",
             ),
         ],
         prompt: Annotated[
             str,
             Field(
                 min_length=1,
-                description="Comprehensive natural language instructions detailing the coding task, requirements, expected file changes, architecture rules, or terminal commands for AGY to execute.",
+                description="Self-contained task: goal, files, rules, done-when, reply format.",
             ),
         ],
         auto_approve: Annotated[
             bool,
             Field(
-                description="When True (default), automatically approves all AGY tool executions without blocking for interactive confirmation.",
+                description="Auto-approve AGY's tool calls and edits.",
             ),
         ] = True,
         mode: Annotated[
             Literal["accept-edits", "plan"],
             Field(
-                description="Execution mode: 'accept-edits' (default) enables autonomous coding with file modification; 'plan' runs read-only analysis.",
+                description="'accept-edits' edits files; 'plan' is read-only.",
             ),
         ] = "accept-edits",
         timeout_seconds: Annotated[
@@ -691,19 +595,19 @@ def create_mcp_server(
             Field(
                 ge=1,
                 le=3600,
-                description="Maximum duration of the background run in seconds before it is cancelled (default: 600). This bounds AGY, not this call - this call returns immediately.",
+                description="Max run time in seconds; bounds AGY, not this call.",
             ),
         ] = 600,
         model: Annotated[
             str,
             Field(
-                description="Optional model id for this task (e.g. 'gemini-3.7-flash-high'). Empty uses MCP_AGY_MODEL, else the agy CLI default.",
+                description="Model id, e.g. 'gemini-3.8-flash-high'. Empty uses MCP_AGY_MODEL. List: `agy models`.",
             ),
         ] = "",
         effort: Annotated[
             str,
             Field(
-                description="Optional reasoning effort: 'low', 'medium', or 'high'. Leave empty when the model id already encodes one - the CLI rejects the combination.",
+                description="'low'|'medium'|'high'. Leave empty when the model id already carries an effort; the CLI rejects both.",
             ),
         ] = "",
         rigor: Annotated[
@@ -790,45 +694,19 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_job_status",
-        description=(
-            "Checks a background AGY job and returns its full result once it has finished.\n\n"
-            "Architect Guidance:\n"
-            "- Recommended waiting method: Monitor `done_marker_path` on disk (e.g. `until [ -f <path> ]; do sleep 5; done`), "
-            "then call `agy_job_status(job_id, wait_seconds=0)` once to collect the result.\n"
-            "- Pass `wait_seconds` to block until the job finishes instead of polling: the call returns "
-            "the moment the job is done, or at the deadline with status still 'running'. Keep `wait_seconds` "
-            "strictly below whatever per-call cap your client enforces (e.g. 60s default on Claude Code, although shipped "
-            "configs may raise it to 30 minutes). Measured incident: a call with `wait_seconds=300` was cut by the client "
-            "timeout, triggering a server process restart. Before result persistence was added, that restart completely "
-            "wiped out a completed 255s / 864k-token job result.\n"
-            "- `status: 'completed'` means the job ran to completion; read `result.status` for whether "
-            "AGY itself succeeded, and `result.modified_files` for what it changed.\n"
-            "- If the server process restarted after the job completed, `recovered_from_disk` will be True.\n"
-            "- 'not_found' means the id is unknown to this server process and no unexpired result exists on disk.\n\n"
-            "Args:\n"
-            "    job_id: Identifier returned by agy_start_task.\n"
-            "    wait_seconds: Seconds to wait for completion before returning (default: 0, max: 600).\n\n"
-            "Returns:\n"
-            "    JobStatusResult containing status, is_done, duration_seconds, result, recovered_from_disk, and error_details."
-        ),
+        description="Get a background job's state and, once finished, its full result.\n\nArchitect Guidance:\n- wait_seconds blocks until the job ends or the deadline; keep it below your client's per-call timeout (Claude Code default: 60s).\n- status 'completed' means the job ran; read result.status for AGY's own outcome and result.modified_files for what changed.\n- 'not_found': unknown or expired id (finished jobs are kept 1h) - re-issue the run.",
     )
     async def agy_job_status(
         job_id: Annotated[
             str,
-            Field(min_length=1, description="Identifier of the job to inspect, as returned by agy_start_task."),
+            Field(min_length=1, description="Id returned by agy_start_task."),
         ],
         wait_seconds: Annotated[
             int,
             Field(
                 ge=0,
                 le=600,
-                description=(
-                    "Block up to this many seconds waiting for the job to finish, returning early the "
-                    "moment it does. 0 (default) reports the current state immediately. The ceiling exists "
-                    "because the call must return inside whatever cap the client enforces; the shipped Claude "
-                    "Code config raises that to 30 minutes, but a client left at its 60-second default will still "
-                    "drop a long wait. Keep wait_seconds below your own configured cap."
-                ),
+                description="Block up to this many seconds for the job to finish (0 reports now, max 600). Keep it below your client's per-call timeout.",
             ),
         ] = 0,
     ) -> JobStatusResult:
@@ -848,23 +726,12 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_cancel_job",
-        description=(
-            "Stops a running background AGY job and terminates its process tree.\n\n"
-            "Architect Guidance:\n"
-            "- Use when a task is going the wrong way, or before starting a replacement run against the "
-            "same workspace.\n"
-            "- Cancellation is not a rollback: files AGY already wrote stay written. Call `agy_get_diff` "
-            "afterwards to see what landed.\n\n"
-            "Args:\n"
-            "    job_id: Identifier returned by agy_start_task.\n\n"
-            "Returns:\n"
-            "    JobStatusResult describing the job after cancellation."
-        ),
+        description="Stop a running job and kill its process tree.\n\nArchitect Guidance:\n- Files already written stay; run agy_get_diff to see them.\n- Cancel before re-running a task on the same workspace.",
     )
     async def agy_cancel_job(
         job_id: Annotated[
             str,
-            Field(min_length=1, description="Identifier of the job to cancel, as returned by agy_start_task."),
+            Field(min_length=1, description="Id returned by agy_start_task."),
         ],
     ) -> JobStatusResult:
         """Stops a running background AGY job and terminates its process tree."""
@@ -880,17 +747,7 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_list_jobs",
-        description=(
-            "Lists every background AGY job this server knows about, newest first.\n\n"
-            "Architect Guidance:\n"
-            "- Use to recover a job id you no longer have, or to see what is still running before "
-            "starting more work.\n"
-            "- Results are omitted here to keep the listing small; collect a finished job's result "
-            "with `agy_job_status(job_id)`.\n"
-            "- Finished jobs are pruned an hour after they end.\n\n"
-            "Returns:\n"
-            "    JobListResult containing jobs (newest first) and running_count."
-        ),
+        description="List background jobs, newest first, with running_count. Results are omitted; fetch one with agy_job_status.\n\nArchitect Guidance:\n- Use it to recover a lost job_id or to see what is running.\n- Jobs waiting on MCP_AGY_MAX_CONCURRENCY also count as running.",
     )
     async def agy_list_jobs() -> JobListResult:
         """Lists every background AGY job this server knows about, newest first."""

@@ -13,7 +13,8 @@
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "false",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high"
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high",
+        "MCP_AGY_MAX_CONCURRENCY": "16"
       },
       "timeout": 1800000
     }

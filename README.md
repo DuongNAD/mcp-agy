@@ -330,7 +330,7 @@ Claude Desktop interacts with MCP servers via local stdio processes.
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "0",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high",
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high",
         "AGY_BIN_PATH": "C:\\Users\\<you>\\AppData\\Local\\agy\\bin\\agy.EXE"
       }
     }
@@ -366,7 +366,7 @@ Cursor supports project-level MCP server definitions in `.cursor/mcp.json`.
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "0",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high",
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high",
         "AGY_BIN_PATH": "C:\\Users\\<you>\\AppData\\Local\\agy\\bin\\agy.EXE"
       }
     }
@@ -403,7 +403,7 @@ Cline allows automated autonomous agent workflows with configurable auto-approva
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "0",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high",
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high",
         "AGY_BIN_PATH": "C:\\Users\\<you>\\AppData\\Local\\agy\\bin\\agy.EXE"
       },
       "disabled": false,
@@ -443,7 +443,7 @@ Roo Code allows specialized custom modes (Architect, Code, Test) delegating to A
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "0",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high",
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high",
         "AGY_BIN_PATH": "C:\\Users\\<you>\\AppData\\Local\\agy\\bin\\agy.EXE"
       },
       "disabled": false,
@@ -476,7 +476,7 @@ Claude Code reads `.mcp.json` from the project root (see `configs/claude_code_mc
         "MCP_AGY_BACKEND": "cli",
         "MCP_AGY_AUTO_FALLBACK": "false",
         "MCP_AGY_LOG_LEVEL": "INFO",
-        "MCP_AGY_MODEL": "gemini-3.7-flash-high"
+        "MCP_AGY_MODEL": "gemini-3.8-flash-high"
       },
       "timeout": 1800000
     }
@@ -911,15 +911,26 @@ Where an equivalent CLI flag exists, the **explicit flag wins**; the environment
 | `MCP_AGY_AUTO_FALLBACK` | `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off` | `false` | Falls back to the simulated mock engine when a real backend is unavailable or errors. **Off by default on purpose** — with it on, a failed run returns a fabricated `status="success"`. |
 | `AGY_BIN_PATH` | File path string | `None` (searches PATH) | Absolute path to the `agy` binary. Checked before `MCP_AGY_CLI_PATH` and before the PATH search — set this when the client launches the server without a usable `PATH`. |
 | `MCP_AGY_CLI_PATH` | File path string | `None` (searches PATH) | Alternate spelling of `AGY_BIN_PATH`, checked second. |
-| `MCP_AGY_MODEL` | Model ID string | `None` (agy CLI default) | Default model for both CLI and SDK backends, e.g. `gemini-3.7-flash-high`. Run `agy models` for valid ids. A per-call `model` argument overrides it. |
+| `MCP_AGY_MODEL` | Model ID string | `None` (agy CLI default) | Default model for both CLI and SDK backends, e.g. `gemini-3.8-flash-high`. Run `agy models` for valid ids. A per-call `model` argument overrides it. |
 | `MCP_AGY_DEFAULT_MODEL` | Model ID string | `None` | Accepted alias for `MCP_AGY_MODEL`, which takes precedence when both are set. |
 | `MCP_AGY_EFFORT` | `low`, `medium`, `high` | `None` (agy CLI default) | Default reasoning effort. A per-call `effort` argument overrides it. |
+| `MCP_AGY_MAX_CONCURRENCY` | Positive integer | `0` (no limit) | Most `agy` processes allowed to run at once; extra background jobs wait inside the server and `timeout_seconds` counts only the run, not the wait. Each `agy` run loads every MCP server in your Antigravity config - measured ~730 MB and ~18 child processes per run on one machine (20 at once: ~14.6 GB; capped at 5: ~2.3 GB). Blank, non-numeric and non-positive values mean no limit. |
+| `MCP_AGY_KILL_CHILDREN_ON_EXIT` | `1`, `true` / `0`, `false`, `no`, `off` | on (Windows only) | Puts the server in a job object so the OS kills every `agy` run it started if the server dies, however it dies. Without it, a server killed by its client left the whole `agy` trees running: measured 43 surviving processes (3 `agy.exe` plus the MCP servers each loads) after a hard kill with 3 jobs in flight, 0 with this on. |
 | `MCP_AGY_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` | Logging verbosity directed strictly to `sys.stderr`. Case-insensitive; an unrecognized value logs a warning and falls back to `INFO` rather than refusing to boot. |
 | `MCP_AGY_DEBUG` | `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off` | `false` | Enables debug mode and raises logging to `DEBUG`. An explicit `MCP_AGY_LOG_LEVEL` still wins over the level this implies. |
 | `MCP_AGY_TOOLKIT_PATH` | Directory path string | `None` (integration off) | Checkout of the [AI Deep Reasoning Toolkit](https://github.com/DuongNAD/ai-deep-reasoning-toolkit). When set, `rigor` on `agy_execute_task` / `agy_start_task` becomes live and results carry a `reasoning` profile. A path without a `GEMINI.md` in it logs a warning and stays off. See [§6](#-6-deep-reasoning-toolkit-integration). |
 | `MCP_AGY_JOB_MARKER_DIR` | Directory path string | System temp dir | Where background-job `.done` markers and persisted results are written. Redirect it to keep one machine's job records isolated (the test suite does). |
 
 ---
+
+
+### Running many tasks at once
+
+- **One workspace per write task.** Edits to one workspace run one at a time; `mode='plan'` jobs may share one. Give each write task its own `git worktree`.
+- **Cap the processes.** Set `MCP_AGY_MAX_CONCURRENCY` (16 is a sensible start). Queued jobs show as `running` in `agy_list_jobs`.
+- **Keep replies short.** Every `agy_job_status` result lands in the architect's context. End each prompt with `REPLY: at most 5 lines - what changed, test result, blockers`, and verify with `agy_get_diff` / `agy_run_tests` rather than the reply.
+- **`/teamwork-preview` as the prompt.** A prompt that starts with AGY's `/teamwork-preview` command makes one `agy` process run a team of subagents. Measured once on four small independent utilities: 1 process / ~1.1 GB / 313 s, against 4 plain jobs at 4 processes / ~3.2 GB / 190 s. Prefer it for one large project; prefer plain jobs when latency matters or the tasks are unrelated.
+- **Slim the worker.** Disable the Antigravity MCP servers a worker does not need (`agy mcp disable <name>`) - above all `mcp-agy` itself, so a worker cannot start workers of its own. This edits your global Antigravity config.
 
 ## 🧪 10. Development, Testing & Verification
 
