@@ -184,6 +184,25 @@ class ReasoningProfile(BaseModel):
     )
 
 
+class WorkerReport(BaseModel):
+    """The closing REPORT block every task prompt asks AGY to end its reply with.
+
+    Parsed rather than trusted: it is AGY's own account, so `changed` is a claim to check against
+    `modified_files` and agy_get_diff, not evidence.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["done", "partial", "blocked", "unknown"] = Field(
+        default="unknown",
+        description="AGY's own verdict: 'done', 'partial', 'blocked'; 'unknown' if it wrote something else",
+    )
+    summary: str = Field(default="", description="One or two sentences on what was done")
+    changed: list[str] = Field(default_factory=list, description="Files AGY says it created or edited")
+    checks: str = Field(default="", description="Commands AGY ran to check its work, and their result")
+    blockers: str = Field(default="", description="What is unresolved or needs the architect's decision")
+
+
 class TaskExecutionResult(BaseModel):
     """Result returned from an autonomous task execution in the target workspace."""
 
@@ -228,6 +247,10 @@ class TaskExecutionResult(BaseModel):
     reasoning: Optional[ReasoningProfile] = Field(
         default=None,
         description="Reasoning protocol this run was carried out under. None when the toolkit integration is switched off",
+    )
+    report: Optional[WorkerReport] = Field(
+        default=None,
+        description="The REPORT block parsed from the end of `response`. None when AGY did not write one",
     )
 
 
@@ -292,6 +315,7 @@ class JobHandle(BaseModel):
         default=None,
         description="Why the job could not be started, if status is 'error'",
     )
+    next_step: str = Field(default="", description="What to do now")
 
 
 class JobStatusResult(BaseModel):
@@ -347,6 +371,34 @@ class JobListResult(BaseModel):
         ),
     )
     running_count: int = Field(default=0, ge=0, description="How many jobs are still running")
+
+
+class JobWaitResult(BaseModel):
+    """What agy_wait hands back: the jobs that finished, each exactly once, and what is left."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["ready", "running", "idle"] = Field(
+        description=(
+            "'ready': `finished` holds at least one new report. 'running': nothing finished within "
+            "the wait - the jobs are unharmed, call agy_wait again. 'idle': nothing is running and "
+            "no report is waiting"
+        )
+    )
+    finished: list[JobStatusResult] = Field(
+        default_factory=list,
+        description="Jobs that finished since their result was last handed out, with full results. Each is returned once",
+    )
+    still_running: list[JobStatusResult] = Field(
+        default_factory=list,
+        description="Jobs in scope that are still running, without results",
+    )
+    running_count: int = Field(default=0, ge=0, description="len(still_running)")
+    unknown_job_ids: list[str] = Field(
+        default_factory=list,
+        description="Requested ids this server has no record of (expired, or from a lost run) - re-issue those tasks",
+    )
+    next_step: str = Field(default="", description="What to do now")
 
 
 class ExecutionResult(BaseModel):

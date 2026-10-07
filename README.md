@@ -145,29 +145,67 @@ pip install -e .
 
 ## 🧰 4. Complete Tool Suite Reference
 
-`mcp-agy` exposes 8 tools tailored for AI Architect agents: 4 synchronous ones that answer
-within a call, and 4 that run AGY as a background job so a long task never has to fit inside
-one.
+`mcp-agy` exposes 9 tools tailored for AI Architect agents: 4 synchronous ones that answer
+within a call, and 5 that run AGY as a background job - a subagent - so a long task never has to
+fit inside one.
 
 **Which to reach for.** `agy_execute_task` and `agy_chat` block until AGY is done, so they only
 work for runs shorter than your client's per-call timeout — 60 seconds on Claude Code. For
 anything larger, and that is most real work, start a job:
 
 ```
-agy_start_task(workspace, prompt)          -> {"job_id": "...", "status": "running"}   # returns at once
-   … the architect keeps working …
-agy_job_status(job_id, wait_seconds=30)    -> {"status": "completed", "result": {...}} # collect
-agy_get_diff(workspace)                    -> review what AGY actually changed
-agy_run_tests(workspace)                   -> verify it
+agy_start_task(workspace, prompt_a)        -> {"job_id": "a…", "status": "running"}    # returns at once
+agy_start_task(workspace_2, prompt_b)      -> {"job_id": "b…", "status": "running"}
+agy_wait()                                 -> {"status": "ready", "finished": [job a + its report],
+                                               "still_running": [job b]}                 # first one back
+agy_get_diff(workspace) / agy_run_tests(workspace)                                       # verify job a
+agy_wait()                                 -> {"status": "ready", "finished": [job b ...]}
+agy_wait()                                 -> {"status": "idle"}                         # all reported
 ```
 
-`agy_job_status` with `wait_seconds` returns the instant the job finishes, so a short job needs
-no polling loop and a long one costs one cheap call per check. The recommended waiting pattern is
-monitoring `done_marker_path` on disk (e.g. `until [ -f <path> ]; do sleep 5; done`) and calling
-`agy_job_status(job_id, wait_seconds=0)`. `wait_seconds` should always be kept strictly below your
-client's per-call timeout: a call with `wait_seconds=300` cut by a 60s client timeout will tear down
-and restart the server process. Completed job results are atomically persisted to disk before `.done`
-markers appear, so finished jobs survive server restarts and return with `recovered_from_disk=True`.
+Completed job results are atomically persisted to disk before `.done` markers appear, so finished
+jobs survive server restarts and return with `recovered_from_disk=True`.
+
+#### Knowing when a subagent is back
+
+There are three signals. Use whichever your client supports; they all lead to the same result.
+
+| Signal | Works in | How |
+|---|---|---|
+| **`agy_wait`** | Every MCP client | Blocks until a job finishes, then returns every finished job's result that has not been handed out yet - each exactly once - plus what is still running. `'running'` means nothing finished inside `wait_seconds`; call again. `'idle'` means nothing is running and nothing is unread. Keep `wait_seconds` below the client's per-call timeout. |
+| **Channel event** | Claude Code CLI, started with channels on | The server declares Claude Code's `claude/channel` capability, and when a job finishes **and nobody has collected it within ~2 s** it sends a `<channel source="mcp-agy" job_id="…" outcome="done">` event into the open session. The architect can end its turn and be told when the work lands. Start Claude Code with `claude --dangerously-load-development-channels server:mcp-agy` (channels are a research preview; this server is not on the approved list, and Team/Enterprise orgs need `channelsEnabled` turned on by an admin). Not available in the desktop app. `MCP_AGY_CHANNEL=0` switches it off. |
+| **`done_marker_path`** | Any client with a background shell | The file appears once the result is on disk: `until [ -f <path> ]; do sleep 5; done`, run in the background, then `agy_wait(job_ids=[id], wait_seconds=0)`. |
+
+`agy_job_status(job_id, wait_seconds=…)` still collects a single job. Reading a finished result
+through it, through `agy_wait` or through `agy_cancel_job` counts as collecting it, so `agy_wait`
+never hands the same report out twice.
+
+#### The REPORT block
+
+Every task prompt (`agy_execute_task`, `agy_start_task`) gets a closing instruction appended by
+the server, so the worker always ends its reply the same way and the architect never has to ask:
+
+```
+REPORT
+STATUS: done | partial | blocked
+SUMMARY: <one or two sentences>
+CHANGED: <files created or edited, or none>
+CHECKS: <commands run to check the work and their result, or none>
+BLOCKERS: <what is unresolved or needs a decision, or none>
+```
+
+It is parsed into `result.report` (`status`, `summary`, `changed`, `checks`, `blockers`), or
+`null` when AGY did not write one. It is the worker's own account: check `changed` against
+`agy_get_diff`. For `mode='plan'` runs the instruction asks for the findings first, since they
+are the deliverable.
+
+#### For models that have never seen this server
+
+- **Server instructions** carry the whole loop (split → `agy_start_task` → `agy_wait` → verify),
+  and every result carries a `next_step` line saying what to do now.
+- **`delegate` prompt** - `/mcp__mcp-agy__delegate` in Claude Code - expands a goal into the full
+  delegation playbook.
+- **`agy://playbook` resource** - the same playbook, for clients that attach resources.
 
 | Tool Name | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|---|
@@ -177,8 +215,10 @@ markers appear, so finished jobs survive server restarts and return with `recove
 | | `mode` | `Literal["accept-edits", "plan"]` | No | `"accept-edits"` | `"plan"` is the read-only form — the long-running equivalent of `agy_chat`. |
 | | `timeout_seconds` | `int` | No | `600` | Bounds **the run**, not this call (1 to 3600). |
 | | `rigor` | `Literal["standard", "deep", "off"]` | No | `"standard"` | Reasoning protocol for the run. Inert unless `MCP_AGY_TOOLKIT_PATH` is set — see [§6](#-6-deep-reasoning-toolkit-integration). |
+| **`agy_wait`** | `job_ids` | `list[str]` | No | `[]` | Jobs to wait on. Empty: every job this server process started. Unknown ids come back in `unknown_job_ids`. |
+| | `wait_seconds` | `int` | No | `45` | Block up to N seconds (0 to 600), returning on the first finish. Keep it below the client's per-call timeout. |
 | **`agy_job_status`** | `job_id` | `str` | **Yes** | — | Id returned by `agy_start_task`. |
-| | `wait_seconds` | `int` | No | `0` | Block up to N seconds, returning early on completion. Capped at 45 so the call always fits inside a client timeout. |
+| | `wait_seconds` | `int` | No | `0` | Block up to N seconds (0 to 600), returning early on completion. Keep it below the client's per-call timeout. |
 | **`agy_cancel_job`** | `job_id` | `str` | **Yes** | — | Stops the run and kills its process tree. Not a rollback — files already written stay written. |
 | **`agy_list_jobs`** | — | — | — | — | Every known job, newest first, without their results. The recovery path when a `job_id` has fallen out of context; collect a result with `agy_job_status`. |
 
@@ -340,7 +380,7 @@ Claude Desktop interacts with MCP servers via local stdio processes.
 *(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 3. Fully restart Claude Desktop.
-4. Click the 🔨 **Hammer icon** in the bottom right corner of Claude's prompt bar. Verify that all 8 tools (`agy_execute_task`, `agy_chat`, `agy_get_diff`, `agy_run_tests`, `agy_start_task`, `agy_job_status`, `agy_cancel_job`, `agy_list_jobs`) appear with green indicators.
+4. Click the 🔨 **Hammer icon** in the bottom right corner of Claude's prompt bar. Verify that all 9 tools (`agy_execute_task`, `agy_chat`, `agy_get_diff`, `agy_run_tests`, `agy_start_task`, `agy_wait`, `agy_job_status`, `agy_cancel_job`, `agy_list_jobs`) appear with green indicators.
 
 ---
 
@@ -486,6 +526,13 @@ Claude Code reads `.mcp.json` from the project root (see `configs/claude_code_mc
 *(Replace `C:\\path\\to\\mcp_agy` with the absolute path to your `mcp_agy` repository).*
 
 `timeout` is not decoration — read the next section before your first real task.
+
+To have finished jobs announce themselves in the session (see [Knowing when a subagent is
+back](#knowing-when-a-subagent-is-back)), start the CLI with channels on for this server:
+
+```bash
+claude --dangerously-load-development-channels server:mcp-agy
+```
 
 ---
 
@@ -708,9 +755,11 @@ never takes the worker's word for what it did.
 2. KEEP WORKING — read the code you are about to review, plan the next unit,
    or start a second job in a *different* workspace. Do not sit on the job id.
 
-3. COLLECT — agy_job_status(job_id, wait_seconds=30)
-   'running'   -> ask again later, the run is unharmed
-   'completed' -> read result.status, result.response, result.modified_files
+3. COLLECT — agy_wait()
+   'ready'     -> each entry in `finished` is one job back: read result.report,
+                  result.modified_files, and result.response if you need the detail
+   'running'   -> nothing finished yet, the runs are unharmed: call agy_wait again
+   'idle'      -> every job has reported
 
 4. VERIFY — never accept the worker's own report as evidence:
    agy_get_diff(workspace_path=…)     # what actually changed on disk
@@ -920,6 +969,7 @@ Where an equivalent CLI flag exists, the **explicit flag wins**; the environment
 | `MCP_AGY_DEBUG` | `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off` | `false` | Enables debug mode and raises logging to `DEBUG`. An explicit `MCP_AGY_LOG_LEVEL` still wins over the level this implies. |
 | `MCP_AGY_TOOLKIT_PATH` | Directory path string | `None` (integration off) | Checkout of the [AI Deep Reasoning Toolkit](https://github.com/DuongNAD/ai-deep-reasoning-toolkit). When set, `rigor` on `agy_execute_task` / `agy_start_task` becomes live and results carry a `reasoning` profile. A path without a `GEMINI.md` in it logs a warning and stays off. See [§6](#-6-deep-reasoning-toolkit-integration). |
 | `MCP_AGY_JOB_MARKER_DIR` | Directory path string | System temp dir | Where background-job `.done` markers and persisted results are written. Redirect it to keep one machine's job records isolated (the test suite does). |
+| `MCP_AGY_CHANNEL` | `0`, `false`, `no`, `off` to disable | on | Declares Claude Code's `claude/channel` capability and announces each finished job nobody has collected within ~2 s. Clients without channels ignore it. See [Knowing when a subagent is back](#knowing-when-a-subagent-is-back). |
 
 ---
 
@@ -928,7 +978,7 @@ Where an equivalent CLI flag exists, the **explicit flag wins**; the environment
 
 - **One workspace per write task.** Edits to one workspace run one at a time; `mode='plan'` jobs may share one. Give each write task its own `git worktree`.
 - **Cap the processes.** Set `MCP_AGY_MAX_CONCURRENCY` (16 is a sensible start). Queued jobs show as `running` in `agy_list_jobs`.
-- **Keep replies short.** Every `agy_job_status` result lands in the architect's context. End each prompt with `REPLY: at most 5 lines - what changed, test result, blockers`, and verify with `agy_get_diff` / `agy_run_tests` rather than the reply.
+- **Keep replies short.** Every collected result lands in the architect's context. The server already asks each task to keep its reply brief and end in a REPORT block; verify with `agy_get_diff` / `agy_run_tests` rather than the reply.
 - **`/teamwork-preview` as the prompt.** A prompt that starts with AGY's `/teamwork-preview` command makes one `agy` process run a team of subagents. Measured once on four small independent utilities: 1 process / ~1.1 GB / 313 s, against 4 plain jobs at 4 processes / ~3.2 GB / 190 s. Prefer it for one large project; prefer plain jobs when latency matters or the tasks are unrelated.
 - **Slim the worker.** Disable the Antigravity MCP servers a worker does not need (`agy mcp disable <name>`) - above all `mcp-agy` itself, so a worker cannot start workers of its own. This edits your global Antigravity config.
 

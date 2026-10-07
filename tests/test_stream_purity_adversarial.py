@@ -223,6 +223,7 @@ class TestStdioSubprocessStreamPurity:
                 "agy_job_status",
                 "agy_cancel_job",
                 "agy_list_jobs",
+                "agy_wait",
             }
 
             # 2. Call agy_chat

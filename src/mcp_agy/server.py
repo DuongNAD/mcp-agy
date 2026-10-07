@@ -12,9 +12,13 @@ per-call timeout:
 Background - the run outlives the call that started it, which is what makes a multi-minute
 task possible at all against a client that caps a single call at 60 seconds:
 - agy_start_task: Launch a run, return a job id immediately
-- agy_job_status: Collect a job's result, optionally waiting a bounded number of seconds
+- agy_wait: Block until the next job finishes and hand back every report not yet collected
+- agy_job_status: Collect one job's result, optionally waiting a bounded number of seconds
 - agy_cancel_job: Stop a run and kill its process tree
 - agy_list_jobs: Recover job ids and see what is still running
+
+A finished job is also announced on Claude Code's channel (see core/channel.py), and the
+`delegate` prompt and `agy://playbook` resource carry the full delegation protocol.
 """
 
 from __future__ import annotations
@@ -23,10 +27,11 @@ import os
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from mcp_agy import __version__
+from mcp_agy.core import channel
 from mcp_agy.core.backend import AGYBackend, get_backend
 from mcp_agy.core.diff_engine import GitDiffEngine, inspect_git_diff
 from mcp_agy.core.jobs import JobRecord, get_job_manager
@@ -36,12 +41,14 @@ from mcp_agy.core.models import (
     JobHandle,
     JobListResult,
     JobStatusResult,
+    JobWaitResult,
     ReasoningProfile,
     TaskExecutionResult,
     TestRunResult,
     TestSummary,
 )
 from mcp_agy.core import reasoning_toolkit
+from mcp_agy.core.report import parse_report, with_report_contract
 from mcp_agy.core.test_runner import MultiEcosystemTestRunner, execute_workspace_tests
 from mcp_agy.utils.logger import configure_logging, get_logger
 from mcp_agy.utils.workspace import (
@@ -55,14 +62,59 @@ logger = get_logger("mcp_agy.server")
 
 SERVER_NAME = "mcp-agy"
 SERVER_INSTRUCTIONS = (
-    "Google Antigravity (AGY) as a coding worker: delegate implementation, analysis, diffs and tests.\n"
-    "Write each prompt in English. AGY cannot see this chat, so every prompt must stand alone:\n"
-    "GOAL: one sentence. FILES: exact paths. RULES: constraints, style, what not to touch. "
-    "DONE WHEN: checkable criteria. REPLY: at most 5 lines - what changed, test result, blockers.\n"
-    "Many tasks: start each with agy_start_task, then collect with agy_job_status. Writes to one "
-    "workspace run one at a time, so give each write task its own git worktree; mode='plan' "
-    "tasks may share a workspace. Verify with agy_get_diff and agy_run_tests, not AGY's own claims."
+    "Google Antigravity (AGY) is your coding subagent: you plan and review, it edits files and runs "
+    "commands. Loop:\n"
+    "1. Split the work into small tasks. AGY cannot see this chat, so each prompt stands alone, in "
+    "English: GOAL (one sentence), FILES (exact paths), RULES (constraints, what not to touch), "
+    "DONE WHEN (checkable criteria). The server asks AGY to end with a REPORT block; do not ask.\n"
+    "2. Start each with agy_start_task (returns a job_id at once). Writes to one workspace run one at "
+    "a time: give parallel write tasks their own git worktree. mode='plan' is read-only and may share.\n"
+    "3. Call agy_wait: it returns when a job finishes, with its report - each report once. Repeat "
+    "until status is 'idle'; 'running' only means nothing finished yet.\n"
+    "4. Verify each report with agy_get_diff and agy_run_tests before accepting; send a corrective "
+    "task if needed.\n"
+    "agy_execute_task / agy_chat block until AGY is done - only for work under ~30s. A finished job "
+    "may also arrive as a <channel> event carrying its job_id: collect it with agy_wait."
 )
+
+PLAYBOOK = """# Delegating to AGY (mcp-agy)
+
+You are the architect. AGY is a coding subagent: it edits files, runs commands and reports back.
+You decide what to build, split it up, review what comes back and decide what is accepted.
+
+## 1. Split
+Break the goal into tasks that are small (one concern, a handful of files) and independent.
+Tasks that must happen in order are separate rounds, not one big prompt.
+
+## 2. Write each prompt so it stands alone
+AGY cannot see this conversation. Write in English:
+- GOAL: one sentence - the behaviour wanted, not the edit.
+- FILES: exact paths to touch, and any that must not change.
+- RULES: project constraints - style, test command, forbidden dependencies.
+- DONE WHEN: criteria AGY can check itself, e.g. "pytest tests/test_auth.py passes".
+The server appends a REPORT instruction; AGY's reply ends with STATUS / SUMMARY / CHANGED /
+CHECKS / BLOCKERS, parsed into `result.report`.
+
+## 3. Dispatch
+- agy_start_task(workspace_path, prompt) for each task; it returns a job_id at once.
+- Edits to one workspace run one at a time. For parallel edits give each task its own git
+  worktree; mode='plan' (read-only) tasks may share a workspace.
+- agy_execute_task / agy_chat block until done: only for work that ends in under ~30s.
+
+## 4. Collect - the "subagent returned" signal
+- agy_wait() blocks until the next job finishes and returns every report not yet collected,
+  each exactly once. Call it again until status is 'idle'.
+- 'running' means nothing finished inside the wait; the jobs are unharmed - call it again, or do
+  other work first. Keep wait_seconds under your client's per-call timeout.
+- In Claude Code with channels on for this server, a job nobody collected also arrives on its own
+  as a <channel> event - then call agy_wait(job_ids=[...]) for the full result.
+- Clients with a background shell can instead wait on the job's `done_marker_path` file.
+
+## 5. Verify, then decide
+Never accept a report on its word: agy_get_diff shows what actually changed, agy_run_tests
+shows whether it still works. Accept, or send one corrective task naming exactly what was wrong.
+agy_cancel_job stops a run that is going the wrong way; files already written stay.
+"""
 
 
 RIGOR_DESCRIPTION = (
@@ -141,6 +193,16 @@ def _stamp_reasoning(
     return result
 
 
+def _finish_result(
+    result: TaskExecutionResult, profile: Optional[ReasoningProfile]
+) -> TaskExecutionResult:
+    """Everything the server adds to a finished run: the reasoning profile and the parsed report."""
+    result = _stamp_reasoning(result, profile)
+    if isinstance(result, TaskExecutionResult) and result.report is None:
+        result.report = parse_report(result.response)
+    return result
+
+
 def create_mcp_server(
     backend: Optional[AGYBackend] = None,
     backend_executor: Optional[Callable[..., Any]] = None,
@@ -152,7 +214,8 @@ def create_mcp_server(
     debug: bool = False,
     log_level: str = "INFO",
 ) -> FastMCP:
-    """Create and configure the FastMCP server with all 8 tools.
+    """Create and configure the FastMCP server with all 9 tools, the `delegate` prompt and the
+    `agy://playbook` resource.
 
     Args:
         backend: Optional explicit AGYBackend instance to use.
@@ -183,6 +246,26 @@ def create_mcp_server(
     # version a user can act on when triaging a client-side bug report.
     server._mcp_server.version = __version__
 
+    if channel.channel_enabled():
+        channel.advertise(server._mcp_server)
+
+    @server.prompt(
+        name="delegate",
+        description="Plan a goal as AGY subagent tasks: split, dispatch with agy_start_task, collect with agy_wait, verify.",
+    )
+    def delegate(goal: str, workspace_path: str = "") -> str:
+        where = f"Workspace: {workspace_path}\n" if workspace_path.strip() else ""
+        return f"{PLAYBOOK}\n---\n\nGoal: {goal}\n{where}\nSplit this goal into AGY tasks and run the loop above."
+
+    @server.resource(
+        "agy://playbook",
+        name="playbook",
+        description="How to delegate work to AGY through this server, end to end.",
+        mime_type="text/markdown",
+    )
+    def playbook() -> str:
+        return PLAYBOOK
+
     def _resolve_backend() -> AGYBackend:
         if backend is not None:
             return backend
@@ -204,7 +287,7 @@ def create_mcp_server(
             str,
             Field(
                 min_length=1,
-                description="Self-contained task: goal, files, rules, done-when, reply format.",
+                description="Self-contained task: goal, files, rules, done-when. The server adds the REPORT format.",
             ),
         ],
         auto_approve: Annotated[
@@ -294,9 +377,10 @@ def create_mcp_server(
             # Inside the lock: provisioning writes into the workspace, and the prompt it may
             # extend has to be the one the backend actually receives.
             effective_prompt, profile = _prepare_reasoning(validated_ws, prompt, rigor)
+            effective_prompt = with_report_contract(effective_prompt, mode)
 
             if backend_executor is not None:
-                return _stamp_reasoning(
+                return _finish_result(
                     await backend_executor(
                         workspace_path=normalized_workspace,
                         prompt=effective_prompt,
@@ -309,7 +393,7 @@ def create_mcp_server(
                 )
 
             active_backend = _resolve_backend()
-            return _stamp_reasoning(
+            return _finish_result(
                 await active_backend.execute_task(
                     workspace_path=normalized_workspace,
                     prompt=effective_prompt,
@@ -561,7 +645,7 @@ def create_mcp_server(
 
     @server.tool(
         name="agy_start_task",
-        description="Start an AGY task in the background and return a job_id at once. Prefer this to agy_execute_task for anything over ~30s.\n\nArchitect Guidance:\n- Start several jobs, do other work, then collect each with agy_job_status.\n- To wait: poll `done_marker_path` on disk (`until [ -f <path> ]; do sleep 5; done`), or use agy_job_status(wait_seconds=...) kept below your client's per-call timeout.\n- mode='plan' is read-only and plan jobs may share a workspace; write jobs on one workspace queue behind each other.\n- After a server restart, finished results are recovered from disk; running jobs are lost - re-issue them.\n- MCP_AGY_MAX_CONCURRENCY caps simultaneous AGY processes; extra jobs wait their turn.",
+        description="Start an AGY subagent task in the background and return a job_id at once. Prefer this to agy_execute_task for anything over ~30s.\n\nArchitect Guidance:\n- Start every independent task first, then call agy_wait: it returns each job's report as the job finishes.\n- Other ways to wait: a <channel> event (Claude Code with --channels), or the `done_marker_path` file appearing.\n- mode='plan' is read-only and plan jobs may share a workspace; write jobs on one workspace queue behind each other.\n- After a server restart, finished results are recovered from disk; running jobs are lost - re-issue them.\n- MCP_AGY_MAX_CONCURRENCY caps simultaneous AGY processes; extra jobs wait their turn.",
     )
     async def agy_start_task(
         workspace_path: Annotated[
@@ -575,7 +659,7 @@ def create_mcp_server(
             str,
             Field(
                 min_length=1,
-                description="Self-contained task: goal, files, rules, done-when, reply format.",
+                description="Self-contained task: goal, files, rules, done-when. The server adds the REPORT format.",
             ),
         ],
         auto_approve: Annotated[
@@ -614,6 +698,7 @@ def create_mcp_server(
             Literal["standard", "deep", "off"],
             Field(description=RIGOR_DESCRIPTION),
         ] = "standard",
+        ctx: Optional[Context] = None,
     ) -> JobHandle:
         """Starts an AGY run in the background and returns a job id immediately."""
         logger.info(f"agy_start_task invoked for workspace='{workspace_path}', mode='{mode}'")
@@ -651,9 +736,10 @@ def create_mcp_server(
             # only one `agy.EXE` existed - the queueing was invisible from the outside.
             async with lock_mgr.lock(validated_ws, shared=(mode == "plan")):
                 effective_prompt, profile = _prepare_reasoning(validated_ws, prompt, rigor)
+                effective_prompt = with_report_contract(effective_prompt, mode)
 
                 if backend_executor is not None:
-                    return _stamp_reasoning(
+                    return _finish_result(
                         await backend_executor(
                             workspace_path=normalized_workspace,
                             prompt=effective_prompt,
@@ -665,7 +751,7 @@ def create_mcp_server(
                         profile,
                     )
                 active_backend = _resolve_backend()
-                return _stamp_reasoning(
+                return _finish_result(
                     await active_backend.execute_task(
                         workspace_path=normalized_workspace,
                         prompt=effective_prompt,
@@ -677,11 +763,19 @@ def create_mcp_server(
                     profile,
                 )
 
-        job = get_job_manager().start(
+        manager = get_job_manager()
+        # The session that started the job is the one to tell when it ends.
+        announce = (
+            channel.make_announcer(ctx.session, manager)
+            if ctx is not None and channel.channel_enabled()
+            else None
+        )
+        job = manager.start(
             runner=_run,
             kind="plan" if mode == "plan" else "task",
             workspace_path=normalized_workspace,
             prompt=prompt,
+            on_finish=announce,
         )
         return JobHandle(
             status="running",
@@ -690,11 +784,67 @@ def create_mcp_server(
             workspace_path=job.workspace_path,
             started_at=job.started_at,
             done_marker_path=job.done_marker_path,
+            next_step=(
+                "Start any other independent tasks now, then call agy_wait to receive each "
+                "report as its job finishes."
+            ),
+        )
+
+    @server.tool(
+        name="agy_wait",
+        description="Wait for AGY subagents to report back: blocks until a background job finishes, then returns every finished job's full result not yet collected (each exactly once) plus what is still running.\n\nArchitect Guidance:\n- Call it after starting jobs, and again after handling each report, until status is 'idle'.\n- 'running' means nothing finished within wait_seconds; nothing is lost - call again.\n- Omit job_ids to wait on every job; pass ids to wait on just those.\n- Verify each finished job with agy_get_diff / agy_run_tests before accepting it.",
+    )
+    async def agy_wait(
+        job_ids: Annotated[
+            list[str],
+            Field(description="Jobs to wait on. Empty: every job this server started."),
+        ] = [],
+        wait_seconds: Annotated[
+            int,
+            Field(
+                ge=0,
+                le=600,
+                description="Block up to this many seconds (0 checks now). Keep it below your client's per-call timeout (Claude Code: 60s).",
+            ),
+        ] = 45,
+    ) -> JobWaitResult:
+        """Blocks until a background AGY job finishes and returns the reports not yet collected."""
+        finished, running, unknown = await get_job_manager().wait_any(
+            [j for j in job_ids if j.strip()], float(wait_seconds)
+        )
+
+        if finished:
+            state = "ready"
+            more = (
+                f" {len(running)} job(s) still running: call agy_wait again after handling these."
+                if running
+                else " Nothing else is running."
+            )
+            next_step = "Verify each finished job with agy_get_diff / agy_run_tests before accepting it." + more
+        elif running:
+            state = "running"
+            next_step = (
+                f"Nothing finished within {wait_seconds}s; {len(running)} job(s) still running and "
+                "unharmed. Call agy_wait again, or do other work first."
+            )
+        else:
+            state = "idle"
+            next_step = "No job is running and no report is waiting to be collected."
+        if unknown:
+            next_step += " Unknown job ids: re-issue those tasks with agy_start_task."
+
+        return JobWaitResult(
+            status=state,  # type: ignore[arg-type]
+            finished=[_describe_job(j) for j in finished],
+            still_running=[_describe_job(j, include_result=False) for j in running],
+            running_count=len(running),
+            unknown_job_ids=unknown,
+            next_step=next_step,
         )
 
     @server.tool(
         name="agy_job_status",
-        description="Get a background job's state and, once finished, its full result.\n\nArchitect Guidance:\n- wait_seconds blocks until the job ends or the deadline; keep it below your client's per-call timeout (Claude Code default: 60s).\n- status 'completed' means the job ran; read result.status for AGY's own outcome and result.modified_files for what changed.\n- 'not_found': unknown or expired id (finished jobs are kept 1h) - re-issue the run.",
+        description="Get one background job's state and, once finished, its full result. To wait on several jobs, use agy_wait.\n\nArchitect Guidance:\n- wait_seconds blocks until the job ends or the deadline; keep it below your client's per-call timeout (Claude Code default: 60s).\n- status 'completed' means the job ran; read result.status for AGY's own outcome and result.modified_files for what changed.\n- 'not_found': unknown or expired id (finished jobs are kept 1h) - re-issue the run.",
     )
     async def agy_job_status(
         job_id: Annotated[
@@ -722,6 +872,8 @@ def create_mcp_server(
                     "the job may have expired past TTL or never finished; re-issue the run with agy_start_task."
                 ),
             )
+        if job.is_done:
+            job.collected = True
         return _describe_job(job)
 
     @server.tool(
@@ -743,6 +895,8 @@ def create_mcp_server(
                 job_id=job_id,
                 error_details="No job with that id in this server process.",
             )
+        if job.is_done:
+            job.collected = True
         return _describe_job(job)
 
     @server.tool(

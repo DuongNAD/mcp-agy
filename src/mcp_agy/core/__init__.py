@@ -20,12 +20,14 @@ from mcp_agy.core.models import (
     JobHandle,
     JobListResult,
     JobStatusResult,
+    JobWaitResult,
     ReasoningProfile,
     TaskExecutionResult,
     TestFailure,
     TestRunResult,
     TestSummary,
     TokenUsage,
+    WorkerReport,
 )
 
 __all__ = [
@@ -37,6 +39,7 @@ __all__ = [
     "TokenUsage",
     "ReasoningProfile",
     "TaskExecutionResult",
+    "WorkerReport",
     "ChatResult",
     "FileDiffStat",
     "DiffResult",
@@ -50,4 +53,5 @@ __all__ = [
     "JobHandle",
     "JobStatusResult",
     "JobListResult",
+    "JobWaitResult",
 ]

@@ -137,7 +137,7 @@ class TestToolRegistrationAndListing:
     @pytest.mark.asyncio
     async def test_exactly_the_expected_tools_are_registered(self, mcp_app):
         """Verifies exactly the required tools are registered - the 4 synchronous ones plus
-        the 4 that run AGY as a background job, and nothing else."""
+        the 5 that run AGY as a background job, and nothing else."""
         tools = await mcp_app.list_tools()
         tool_names = {t.name for t in tools}
         expected_names = {
@@ -149,6 +149,7 @@ class TestToolRegistrationAndListing:
             "agy_job_status",
             "agy_cancel_job",
             "agy_list_jobs",
+            "agy_wait",
         }
         assert tool_names == expected_names
         assert len(tools) == len(expected_names)

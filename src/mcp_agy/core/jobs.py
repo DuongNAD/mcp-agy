@@ -24,7 +24,7 @@ from pathlib import Path
 import tempfile
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from mcp_agy.utils.logger import get_logger
 
@@ -183,6 +183,9 @@ class JobRecord:
         self.task: Optional[asyncio.Task[Any]] = None
         self.done_marker_path = done_marker_path
         self.recovered_from_disk = recovered_from_disk
+        # Set once a finished result has been handed to the architect, so agy_wait returns each
+        # report exactly once and a completion announcement is not sent for one already read.
+        self.collected = False
 
     @property
     def is_done(self) -> bool:
@@ -199,6 +202,10 @@ class JobManager:
 
     def __init__(self) -> None:
         self._jobs: Dict[str, JobRecord] = {}
+        # job id -> how many waits are blocked on it right now. A job someone is waiting on will
+        # be collected the moment it ends, so it needs no completion announcement.
+        self._waiters: Dict[str, int] = {}
+        self._callbacks: Set[asyncio.Task[Any]] = set()
 
     def start(
         self,
@@ -206,8 +213,14 @@ class JobManager:
         kind: str,
         workspace_path: str,
         prompt: str,
+        on_finish: Optional[Callable[[JobRecord], Awaitable[None]]] = None,
     ) -> JobRecord:
-        """Launch `runner` in the background and return its record immediately."""
+        """Launch `runner` in the background and return its record immediately.
+
+        `on_finish` runs after a job completes or fails - not after a cancel, which the architect
+        asked for and already knows about. It runs as its own task, so a slow or failing
+        callback can never hold up the job's own completion.
+        """
         self._prune()
         job_id = str(uuid.uuid4())
         done_marker_path = str(_marker_dir() / f"{job_id}.done")
@@ -285,11 +298,91 @@ class JobManager:
                             f"Failed to write done marker for job {job.job_id} at {job.done_marker_path}: {exc}"
                         )
 
+                if on_finish is not None and job.status in (COMPLETED, FAILED):
+                    self._spawn_callback(on_finish, job)
+
         # The registry holds the only strong reference to this task. Without it the event loop
         # may garbage-collect a running task mid-flight.
         job.task = asyncio.create_task(_execute())
         logger.info(f"Started background job {job.job_id} ({kind}) for workspace '{workspace_path}'")
         return job
+
+    def _spawn_callback(
+        self, callback: Callable[[JobRecord], Awaitable[None]], job: JobRecord
+    ) -> None:
+        async def _guarded() -> None:
+            try:
+                await callback(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"on_finish callback for job {job.job_id} failed: {exc}")
+
+        task = asyncio.create_task(_guarded())
+        # Held here so the loop cannot garbage-collect it mid-flight.
+        self._callbacks.add(task)
+        task.add_done_callback(self._callbacks.discard)
+
+    def is_awaited(self, job_id: str) -> bool:
+        """True while some agy_wait / agy_job_status call is blocked waiting on this job."""
+        return self._waiters.get(job_id, 0) > 0
+
+    async def _wait_tasks(self, jobs: Sequence[JobRecord], timeout_seconds: float) -> None:
+        """Block until any of `jobs` ends or the deadline passes, counting as a waiter on each."""
+        tasks = {j.task for j in jobs if j.task is not None and not j.is_done}
+        if not tasks or timeout_seconds <= 0:
+            return
+        ids = [j.job_id for j in jobs]
+        for job_id in ids:
+            self._waiters[job_id] = self._waiters.get(job_id, 0) + 1
+        try:
+            # asyncio.wait never cancels what it waits on, so a wait that times out - or a caller
+            # that goes away - leaves every job running.
+            await asyncio.wait(tasks, timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for job_id in ids:
+                remaining = self._waiters.get(job_id, 0) - 1
+                if remaining > 0:
+                    self._waiters[job_id] = remaining
+                else:
+                    self._waiters.pop(job_id, None)
+
+    async def wait_any(
+        self, job_ids: Sequence[str], timeout_seconds: float
+    ) -> Tuple[List[JobRecord], List[JobRecord], List[str]]:
+        """Wait for the next finished job and hand out every result not yet collected.
+
+        Scope is `job_ids`, or - when empty - every job this process started. Jobs recovered
+        from disk are only in scope when named: without ids there is no telling whether a
+        previous server process already handed them out.
+
+        Returns (finished, still_running, unknown_ids). `finished` is marked collected, so the
+        same report is never returned twice. Returns at once when something is already waiting
+        to be collected, or when nothing in scope is running.
+        """
+        unknown: List[str] = []
+        if job_ids:
+            scope: List[JobRecord] = []
+            for job_id in dict.fromkeys(job_ids):
+                job = self.get(job_id)
+                if job is None:
+                    unknown.append(job_id)
+                else:
+                    scope.append(job)
+        else:
+            scope = [j for j in self._jobs.values() if not j.recovered_from_disk]
+
+        def _uncollected() -> List[JobRecord]:
+            return [j for j in scope if j.is_done and not j.collected]
+
+        if not _uncollected():
+            await self._wait_tasks([j for j in scope if not j.is_done], timeout_seconds)
+
+        finished = sorted(_uncollected(), key=lambda j: j.finished_at or 0.0)
+        for job in finished:
+            job.collected = True
+        still_running = [j for j in scope if not j.is_done]
+        return finished, still_running, unknown
 
     def get(self, job_id: str) -> Optional[JobRecord]:
         job = self._jobs.get(job_id)
@@ -337,17 +430,9 @@ class JobManager:
         job = self._jobs.get(job_id)
         if job is None or job.is_done or job.task is None or timeout_seconds <= 0:
             return job
-        try:
-            await asyncio.wait_for(asyncio.shield(job.task), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            # The job was cancelled underneath us; its own handler recorded the outcome.
-            pass
-        except Exception:
-            # The job's exception is recorded on the record itself - shielded here so a failed
-            # job reports as a failed job rather than raising out of a status query.
-            pass
+        # A job's own exception or cancellation is recorded on the record, and asyncio.wait
+        # neither raises it nor cancels the job when the wait times out.
+        await self._wait_tasks([job], timeout_seconds)
         return job
 
     async def cancel(self, job_id: str) -> Optional[JobRecord]:

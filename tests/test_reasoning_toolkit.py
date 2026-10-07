@@ -20,6 +20,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from mcp_agy.core import reasoning_toolkit
 from mcp_agy.core.models import TaskExecutionResult
+from mcp_agy.core.report import with_report_contract
 from mcp_agy.server import create_mcp_server
 
 
@@ -83,14 +84,21 @@ def toolkit_env(monkeypatch, fake_toolkit: Path):
 
 
 class PromptCapturingExecutor:
-    """Stands in for a backend, recording the prompt it was handed."""
+    """Stands in for a backend, recording the prompt it was handed.
+
+    Every task prompt ends in the server's REPORT contract, which is not the toolkit's doing:
+    it is checked here and recorded without it, so these tests see only what the toolkit changed.
+    """
 
     def __init__(self, response: str = "done") -> None:
         self.response = response
         self.prompts: list[str] = []
 
     async def __call__(self, **kwargs) -> TaskExecutionResult:
-        self.prompts.append(kwargs["prompt"])
+        prompt = kwargs["prompt"]
+        contract = with_report_contract("", kwargs.get("mode", "accept-edits"))
+        assert prompt.endswith(contract), "every task prompt must end in the REPORT contract"
+        self.prompts.append(prompt[: -len(contract)])
         return TaskExecutionResult(status="success", response=self.response)
 
 
