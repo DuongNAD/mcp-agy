@@ -473,6 +473,7 @@ class TestEnvironmentVariableConfiguration:
             "MCP_AGY_MODEL",
             "MCP_AGY_DEFAULT_MODEL",
             "MCP_AGY_EFFORT",
+            "MCP_AGY_MAX_CONCURRENCY",
             "AGY_BIN_PATH",
             "PYTHONIOENCODING",
             "PYTHONUTF8",

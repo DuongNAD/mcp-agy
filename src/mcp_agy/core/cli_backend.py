@@ -7,11 +7,13 @@ and parses streaming NDJSON telemetry into structured execution results.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Set
+import weakref
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, List, Optional, Set
 
 from mcp_agy.core.backend import AGYBackend
 from mcp_agy.core.models import (
@@ -43,6 +45,61 @@ FILE_MODIFICATION_TOOLS: Set[str] = {
     "sed_file",
     "notebook_edit",
 }
+
+
+MAX_CONCURRENCY_ENV = "MCP_AGY_MAX_CONCURRENCY"
+
+# One semaphore per (event loop, limit). A semaphore is bound to the loop that first contends
+# on it, and the test suite builds a fresh loop per case, so a module-level one would raise on
+# the second. Keying by limit too lets the env var be changed between calls.
+_slots: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[int, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def max_concurrency() -> int:
+    """How many agy processes may run at once; 0 means no limit.
+
+    Unset, blank, non-numeric and non-positive all mean "no limit": a typo in this variable must
+    not quietly serialise every run, nor refuse them.
+
+    Why a cap exists at all: each agy run loads every MCP server in the user's Antigravity
+    config, measured at ~18 child processes and ~730 MB per run. Twenty at once peaked at
+    ~14.6 GB, so fifty would ask for ~36 GB. Nothing else in this server bounds that - jobs are
+    started without limit, and only runs against one workspace queue behind each other.
+    """
+    raw = (os.environ.get(MAX_CONCURRENCY_ENV) or "").strip()
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        logger.warning(f"{MAX_CONCURRENCY_ENV}={raw!r} is not an integer; running with no limit.")
+        return 0
+
+
+@contextlib.asynccontextmanager
+async def _agy_slot() -> AsyncIterator[None]:
+    limit = max_concurrency()
+    if limit <= 0:
+        yield
+        return
+
+    per_loop = _slots.setdefault(asyncio.get_running_loop(), {})
+    semaphore = per_loop.setdefault(limit, asyncio.Semaphore(limit))
+    async with semaphore:
+        yield
+
+
+async def _stream_in_slot(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+    """`stream_subprocess_lines`, started only once a slot is free.
+
+    The slot is taken before the process is spawned and held until the stream closes, so
+    `timeout_seconds` - which `stream_subprocess_lines` starts counting at spawn - bounds the run
+    and not the wait in the queue. A cancelled or timed-out run leaves through the generator's
+    normal exit, which releases the slot.
+    """
+    async with _agy_slot():
+        async for line in stream_subprocess_lines(*args, **kwargs):
+            yield line
 
 
 async def _detect_changed_files(workspace_path: str, since_wall_ts: float) -> Set[str]:
@@ -151,8 +208,6 @@ def find_agy_executable() -> Optional[str]:
     win_paths = [
         os.path.expandvars(r"%LOCALAPPDATA%\agy\bin\agy.EXE"),
         os.path.expandvars(r"%LOCALAPPDATA%\agy\bin\agy.exe"),
-        r"C:\Users\Admin\AppData\Local\agy\bin\agy.EXE",
-        r"C:\Users\Admin\AppData\Local\agy\bin\agy.exe",
     ]
     for p in win_paths:
         if os.path.isfile(p):
@@ -317,7 +372,7 @@ class SubprocessCLIBackend(AGYBackend):
             if (request.workspace_path and os.path.isdir(request.workspace_path))
             else None
         )
-        async for line in stream_subprocess_lines(
+        async for line in _stream_in_slot(
             cmd,
             cwd=valid_cwd,
             timeout_seconds=float(request.timeout_seconds),
@@ -466,7 +521,7 @@ class SubprocessCLIBackend(AGYBackend):
         )
         outcome = SubprocessOutcome()
         try:
-            async for line in stream_subprocess_lines(
+            async for line in _stream_in_slot(
                 cmd,
                 cwd=valid_cwd,
                 timeout_seconds=float(request.timeout_seconds),
