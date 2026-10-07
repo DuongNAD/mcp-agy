@@ -17,6 +17,7 @@ from mcp_agy.core.backend import AGYBackend, get_backend, set_backend
 from mcp_agy.core.mock_backend import MockAGYBackend
 from mcp_agy.server import create_mcp_server, mcp
 from mcp_agy.utils.logger import configure_logging, get_logger
+from mcp_agy.utils.process import kill_children_on_exit
 
 logger = get_logger("mcp_agy.cli")
 
@@ -226,6 +227,7 @@ def main(
     )
 
     # 5. Execute server transport loop
+    kill_children_on_exit()
     if transport_norm == "stdio":
         server_instance.run(transport="stdio")
     elif transport_norm == "sse":

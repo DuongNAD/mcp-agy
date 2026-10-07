@@ -40,6 +40,9 @@ if str(SRC_DIR) not in sys.path:
 
 # Isolate test suite from live agy.EXE subprocesses by defaulting to mock backend
 os.environ.setdefault("MCP_AGY_BACKEND", "mock")
+# `cli.main` binds the process to a kill-on-close job object. Tests call it in-process, which
+# would put pytest itself in that job; test_kill_children_on_exit opts back in inside a child.
+os.environ.setdefault("MCP_AGY_KILL_CHILDREN_ON_EXIT", "0")
 
 from mcp_agy.core.backend import AGYBackend, MockAGYBackend, set_backend, reset_backend
 from mcp_agy.core.models import (

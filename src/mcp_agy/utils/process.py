@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -21,6 +22,118 @@ logger = get_logger("mcp_agy.utils.process")
 # How much of a child's stderr is kept. The tail is what matters: a CLI states why it gave up
 # on its last lines. Bounded so a chatty child cannot grow the server's memory without limit.
 STDERR_TAIL_LIMIT_BYTES = 8192
+
+
+KILL_CHILDREN_ENV = "MCP_AGY_KILL_CHILDREN_ON_EXIT"
+
+# Held for the life of the process. Closing the handle is what fires KILL_ON_JOB_CLOSE, and the
+# OS closes it for us when this process dies - however it dies, including a hard kill.
+_job_handle: Optional[int] = None
+
+
+def kill_children_on_exit() -> bool:
+    """Make the OS kill every process this server started if the server itself dies. Windows only.
+
+    Why: `terminate_process_tree` only runs while this process is alive to run it. A client that
+    gives up on a slow tool call kills the server outright, and nothing then reaps the agy runs
+    it had going. Measured: after a hard kill with three jobs in flight, 49 processes survived -
+    three agy.exe plus the ~16 MCP servers each of them loads - and kept spending RAM and
+    quota. Every job started with `agy_start_task` is one more tree left behind.
+
+    Method: put this process in a job object flagged KILL_ON_JOB_CLOSE. Children inherit the
+    membership, and the OS tears the whole job down when the last handle closes. Nested jobs are
+    supported since Windows 8, so this still works when a launcher already put us in one.
+
+    Returns True when active. A failure is logged and returns False: a server that cannot reap
+    its orphans is still a server worth starting. `MCP_AGY_KILL_CHILDREN_ON_EXIT=0` opts out.
+    """
+    global _job_handle
+    if _job_handle is not None:
+        return True
+    if sys.platform != "win32":
+        return False
+    if (os.environ.get(KILL_CHILDREN_ENV) or "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimits),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        limits = _ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+        if not kernel32.SetInformationJobObject(
+            job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits), ctypes.sizeof(limits)
+        ) or not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+            error = ctypes.WinError(ctypes.get_last_error())
+            kernel32.CloseHandle(job)
+            raise error
+
+        _job_handle = int(job)
+        logger.info("Child processes will be killed with this server (Windows job object).")
+        return True
+    except Exception as exc:
+        logger.warning(
+            f"Could not bind child processes to the server's lifetime: {exc}. Runs in flight "
+            "when the server is killed will be left running."
+        )
+        return False
 
 
 @dataclass
